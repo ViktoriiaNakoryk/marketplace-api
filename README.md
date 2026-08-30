@@ -1,22 +1,89 @@
-# Marketplace API — ДЗ #1 (контракт-first)
+# Marketplace API
 
-## Варіант: Б — runtime-валідація (express-openapi-validator)
+## Configuration
 
-## Встановлення
-npm install
+Уся конфігурація застосунку описана однією zod-схемою в `src/config/env.schema.ts`
+і перевіряється при старті. Якщо якоїсь змінної бракує або вона зламана — застосунок
+**не запуститься** й напише, що саме не так. Краще впасти одразу, ніж на першому запиті в проді.
 
-## Запуск сервера
-npm start        # http://localhost:3000
+### Які є змінні
 
-## Перевірка спеки
-npm run lint
+Повний список із прикладами лежить у файлі `.env.example`. Щоб почати — просто скопіюй його:
 
-## Перевірка сервера (3 запити)
-curl -i -X POST http://localhost:3000/orders -H "Content-Type: application/json" -d '{"items":[{}]}'
-Очікуємо: HTTP/1.1 400 Bad Request, "request/headers must have required property 'idempotency-key'"
+```bash
+cp .env.example .env
+```
 
-curl -i -X POST http://localhost:3000/orders -H "Content-Type: application/json" -H "Idempotency-Key: abc-123" -d '{"items":[]}'
-Очікуємо: HTTP/1.1 400 Bad Request, "request/body/items must NOT have fewer than 1 items"
+Коротко про кожну:
 
-curl -i -X POST http://localhost:3000/orders -H "Content-Type: application/json" -H "Idempotency-Key: abc-123" -d '{"items":[{"product_id":1}]}'
-Очікуємо: HTTP/1.1 201 Created
+- **PORT** — на якому порту слухати HTTP (за замовчуванням `3000`).
+- **LOG_LEVEL** — рівень логів: `debug`, `info`, `warn` або `error` (за замовчуванням `info`).
+- **DB_URL** — рядок підключення до Postgres, напр. `postgres://appuser@localhost:5432/marketplace`.
+  Пароля тут **немає** — він читається окремо, з файла.
+- **DB_PASSWORD_FILE** — шлях до файла з паролем БД (за замовчуванням `./secrets/db_password`).
+
+Пароль винесений у файл навмисно: так його можна змінювати «на живу», без перезапуску застосунку.
+
+Якщо додаси нову змінну в схему — не забудь дописати її і в `.env.example`. Перевірити, що вони
+не розійшлися, можна командою:
+
+```bash
+npm run check:env
+```
+
+### Як запустити
+
+1. Підняти базу:
+
+   ```bash
+   docker compose up -d
+   ```
+
+   Postgres сам створить користувача `appuser` через `init.sql`.
+
+2. Покласти пароль у файл-секрет (значення має збігатися з тим, що в `init.sql`):
+
+   ```bash
+   mkdir -p secrets && printf 'app-v1-password' > secrets/db_password
+   ```
+
+3. Поставити залежності та запустити:
+
+   ```bash
+   npm ci
+   npm run start
+   ```
+
+   Застосунок буде на http://localhost:3000
+
+4. Перевірити, що живий і бачить базу:
+
+   ```bash
+   curl localhost:3000/health       # чи живий застосунок
+   curl localhost:3000/health/db    # чи ходить у базу
+   ```
+
+### Як поміняти пароль БД без перезапуску
+
+Пароль до бази можна змінити, і застосунок навіть не помітить — жодного рестарту.
+
+1. Подивись поточний uptime, щоб потім порівняти:
+
+   ```bash
+   curl localhost:3000/health
+   ```
+
+2. Запусти ротацію:
+
+   ```bash
+   bash rotate.sh
+   ```
+
+   Скрипт згенерує новий пароль, оновить його в базі та у файлі-секреті й закриє старі з'єднання.
+
+3. Перевір, що все працює далі:
+
+   ```bash
+   curl localhost:3000/health/db    # має відповісти 200 — уже з новим паролем
+   curl localhost:3000/health       # uptime більший, ніж був — значить, рестарту не було
+   ```

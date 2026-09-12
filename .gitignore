@@ -4,3 +4,5 @@ dist/
 *.log
 spec.json
 *.tsbuildinfo
+.env
+secrets/

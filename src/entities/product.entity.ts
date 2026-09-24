@@ -13,6 +13,7 @@ import { OrderItem } from './order-item.entity';
 
 @Entity('products')
 @Check(`"price" > 0`)
+@Check(`"stock" >= 0`)
 export class Product {
     @PrimaryGeneratedColumn({ type: 'bigint' })
     id: string;
@@ -43,9 +44,13 @@ export class Product {
     @Column({ type: 'int' })
     price: number;
 
+    @Column({ type: 'int', default: 0 })
+    stock: number;
+
     @CreateDateColumn({ type: 'timestamptz' })
     createdAt: Date;
 
+    @Index('idx_products_search_vector', { synchronize: false })
     @Column({
         type: 'tsvector',
         asExpression: `to_tsvector('simple', name || ' ' || description)`,

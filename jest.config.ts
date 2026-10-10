@@ -10,21 +10,39 @@ const { config: tsconfig } = ts.readConfigFile(
 );
 const paths = tsconfig?.compilerOptions?.paths ?? {};
 
-const config: Config = {
+const base = {
   moduleFileExtensions: ['js', 'json', 'ts'],
   rootDir: '.',
-  testRegex: '.*\\.spec\\.ts$',
   transform: {
     '^.+\\.(t|j)s$': 'ts-jest',
   },
   moduleNameMapper: pathsToModuleNameMapper(paths, { prefix: '<rootDir>/' }),
+  testEnvironment: 'node',
+};
+
+const withPostgres = {
+  globalSetup: '<rootDir>/test/testkit/global-setup.ts',
+  globalTeardown: '<rootDir>/test/testkit/global-teardown.ts',
+};
+
+const config: Config = {
+  reporters: ['default'],
+  verbose: true,
+  maxWorkers: 1,
+  testTimeout: 60_000,
   collectCoverageFrom: [
     'src/**/*.(t|j)s',
     'libs/**/*.(t|j)s',
     'apps/**/*.(t|j)s',
   ],
   coverageDirectory: './coverage',
-  testEnvironment: 'node',
+  projects: [
+    { ...base, displayName: 'unit', testMatch: ['<rootDir>/src/**/*.spec.ts'] },
+    { ...base, ...withPostgres, displayName: 'integration', testMatch: ['<rootDir>/test/integration/**/*.spec.ts'] },
+    { ...base, ...withPostgres, displayName: 'e2e', testMatch: ['<rootDir>/test/e2e/**/*.e2e-spec.ts'] },
+    { ...base, displayName: 'contract', testMatch: ['<rootDir>/test/contract/consumer.pact-spec.ts'] },
+    { ...base, ...withPostgres, displayName: 'provider', testMatch: ['<rootDir>/test/contract/provider.pact-spec.ts'] },
+  ],
 };
 
 export default config;

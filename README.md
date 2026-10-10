@@ -33,6 +33,117 @@ npm run check:env
 
 ---
 
+## Тестування (ДЗ #16)
+
+«Драбинка довіри»: unit → integration проти справжнього Postgres → E2E усього Nest-застосунку →
+контракт із фронтендом через Pact + брокер + `can-i-deploy`.
+
+| Команда | Що ганяє | Postgres |
+|---------|----------|----------|
+| `npm test` | unit-тести контролерів (`src/**/*.spec.ts`) | — |
+| `npm run test:integration` | репозиторії `Users`/`Products`/`Orders` (`test/integration/`) | testcontainers |
+| `npm run test:e2e` | повний `AppModule` через supertest (`test/e2e/`) | testcontainers |
+| `npm run test:contract` | consumer-тест уявного фронтенду `marketplace-web` → `pacts/*.json` | — |
+| `npm run verify:provider` | справжній застосунок проти контракту зі `stateHandlers` | testcontainers |
+
+Усе — один `jest.config.ts` з `projects` (`--selectProjects …`), `reporters: ['default']`,
+`maxWorkers: 1` (кожен воркер множив би контейнери). Збірка тестів — `ts-jest` (це `tsc`, тож
+decorator-метадані на місці). NestJS 12 — ESM-only, тому скрипти запускають jest з
+`NODE_OPTIONS=--experimental-vm-modules` (нативний `require(esm)` у Jest 30 на Node ≥ 24.9).
+
+**Testcontainers.** `test/testkit/global-setup.ts` піднімає `postgres:16-alpine`
+(`PostgreSqlContainer`), проганяє ті самі TypeORM-міграції, що й прод, і віддає
+`container.getConnectionUri()` у `DB_URL`. Сховище для тестів не потрібне: адреса бази
+народжується в рантаймі. `global-teardown.ts` зупиняє контейнер.
+
+**Що покрито понад мок.** `23505` (unique `email`, `sku`), `23503` (FK на продавця/покупця),
+`23514` (CHECK `price > 0`); підрахунок `total` з цін каталогу через `JOIN` в одному
+data-modifying CTE; атомарність (невідомий товар → жодного рядка в `orders`); `json_agg` позицій;
+keyset-пагінація.
+
+**Ізоляція — транзакція + ROLLBACK.** Кожен integration-тест працює в одному `pg.Client`:
+`BEGIN` у `beforeEach`, `ROLLBACK` в `afterEach` (`test/testkit/transaction.ts`). Репозиторії
+приймають будь-що з `query()` (`Pool` або `Client`), тож у тесті вони працюють у тій самій
+транзакції. Обрала ROLLBACK, бо він найдешевший (нічого не видаляється, лише відкочується) і
+найчистіший: тест не бачить даних сусіда й не залежить від порядку запуску. Разом зі свіжим
+контейнером на кожен прогін `npm run test:integration && npm run test:integration` зелений без
+ручної чистки. E2E і provider так не можуть (застосунок комітить через власний пул), тому там
+ізоляція — свіжий контейнер на прогін + унікальні дані з builders / `ON CONFLICT DO NOTHING`.
+
+**Test data builders.** `test/testkit/builders.ts`: `aUser()`, `aSeller()`, `aProduct(sellerId)`,
+`anOrder(buyerId)`, `anItem(productId)` — валідні дефолти з унікальними `email`/`sku`, у тесті
+перевизначається лише те, що важливе для сценарію.
+
+**E2E.** `Test.createTestingModule({ imports: [AppModule] })` без підмін провайдерів, пайпи —
+зі спільної `configureApp()` (`src/app.setup.ts`), яку викликає і `main.ts`. Сценарій:
+`POST /orders` → `GET /orders/{id}`, плюс `404` на неіснуюче замовлення і `400` від `ValidationPipe`
+на порожній `items`.
+
+**Контракт.** `test/contract/consumer.pact-spec.ts` описує дві interaction з provider state:
+`GET /orders/9001` (`order 9001 exists`) і `GET /products/9001` (`product 9001 exists`); форма тіла
+задана матчерами `MatchersV3` і відповідає схемам `Order`/`Product` у `openapi/openapi.yaml`
+(ДЗ #9). `pacts/marketplace-web-marketplace-api.json` закомічено, щоб контракт можна було
+рев'ювити; CI генерує його заново. `verify:provider` піднімає застосунок на випадковому порту,
+`stateHandlers` сідять БД через `INSERT … ON CONFLICT DO NOTHING`. Якщо `PACT_BROKER_URL` задано,
+контракт береться з брокера і результат публікується (`publishVerificationResult: true`), якщо ні,
+перевіряється локальний `pacts/*.json`.
+
+### Брокер локально
+
+`docker compose up -d --wait` піднімає й `pact-broker` (`:9292`, sqlite, healthcheck на
+`127.0.0.1`). Адреса й токен брокера — секрети: код читає лише `process.env.PACT_BROKER_URL` /
+`PACT_BROKER_TOKEN`. Локально вони приходять зі сховища ДЗ #11 тією самою обгорткою, у CI — з
+GitHub secrets (якщо секрету `PACT_BROKER_URL` нема, job піднімає брокер із compose).
+
+```bash
+bash scripts/with-secrets.sh dev npm run verify:provider
+PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider
+```
+
+Перший рядок — основний шлях (значення зі сховища). Другий — аварійна форма для грейдера без
+доступу до сховища; під `SKIP_VAULT=1` обгортка виконує рівно її.
+
+Допоміжні скрипти: `scripts/pact-publish.sh` (PUT контракту), `scripts/can-i-deploy.sh`
+(`to <tag>` або `with <pacticipant> <version>`; exit 1, якщо `deployable` не `true`),
+`scripts/pact-tag.sh` (тег версії).
+
+### CI: job `contract`
+
+`.github/workflows/ci.yml`: `test:contract` → publish → `verify:provider` з публікацією
+результату → `can-i-deploy` (consumer@sha × provider@sha; job падає, якщо `deployable` ≠ `true`) →
+на push у `main` тег провайдера `prod`.
+
+### Гейт у роботі
+
+Версія консюмера й провайдера — `V=$(git rev-parse --short HEAD)` (у моєму прогоні `3332bb3`).
+
+```bash
+docker compose up -d --wait
+export PACT_BROKER_URL=http://127.0.0.1:9292 V=$(git rev-parse --short HEAD)
+npm run test:contract
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/$V" \
+  -H 'Content-Type: application/json' --data-binary @pacts/marketplace-web-marketplace-api.json   # 201
+PACT_PROVIDER_VERSION=$V npm run verify:provider                                                   # exit 0
+curl -sS "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$V&to=prod"            # до тега
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/$V/tags/prod" \
+  -H 'Content-Type: application/json'                                                              # 201
+curl -sS "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$V&to=prod"            # після тега
+```
+
+`can-i-deploy` **до** тега `prod` (поле `summary` відповіді):
+
+```json
+{"deployable":null,"reason":"There is no verified pact between version 3332bb3 of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)","success":0,"failed":0,"unknown":1}
+```
+
+`can-i-deploy` **після** тега `prod`:
+
+```json
+{"deployable":true,"reason":"All required verification results are published and successful","success":1,"failed":0,"unknown":0}
+```
+
+---
+
 ## Data layer ops (ДЗ #15)
 
 ```
@@ -241,6 +352,19 @@ bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 psql -h 127.0.0.1 -p 6432 -U admin -d marketplace -c "SELECT 1"
 psql -h 127.0.0.1 -p 6432 -U admin -d pgbouncer -c "SHOW POOLS"
 ```
+
+Тести (ДЗ #16). Потрібен лише запущений Docker; `DATABASE_URL` тестам не потрібен — його видає
+testcontainer. Для кроку з брокером — аварійна форма без сховища:
+
+```bash
+npm run test:integration && npm run test:integration
+npm run test:e2e
+npm run test:contract
+npm run verify:provider
+PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider
+```
+
+Повна послідовність гейта `can-i-deploy` — у [«Гейт у роботі»](#гейт-у-роботі).
 
 ---
 

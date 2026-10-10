@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run test:integration
+      - run: npm run test:e2e
+
+  contract:
+    runs-on: ubuntu-latest
+    env:
+      PACT_BROKER_URL: ${{ secrets.PACT_BROKER_URL }}
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+      PACT_CONSUMER_VERSION: ${{ github.sha }}
+      PACT_PROVIDER_VERSION: ${{ github.sha }}
+      PACT_PROVIDER_BRANCH: ${{ github.head_ref || github.ref_name }}
+      PACT_DO_NOT_TRACK: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      - name: Start Pact Broker from compose (no PACT_BROKER_URL secret)
+        if: env.PACT_BROKER_URL == ''
+        run: |
+          docker compose up -d --wait pact-broker
+          echo "PACT_BROKER_URL=http://127.0.0.1:9292" >> "$GITHUB_ENV"
+
+      - name: Consumer test → pacts/*.json
+        run: npm run test:contract
+
+      - name: Publish contract
+        run: bash scripts/pact-publish.sh
+
+      - name: Provider verification (publishVerificationResult true)
+        run: npm run verify:provider
+
+      - name: can-i-deploy
+        run: bash scripts/can-i-deploy.sh marketplace-web "$PACT_CONSUMER_VERSION" with marketplace-api "$PACT_PROVIDER_VERSION"
+
+      - name: Tag provider version as prod
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: bash scripts/pact-tag.sh marketplace-api "$PACT_PROVIDER_VERSION" prod

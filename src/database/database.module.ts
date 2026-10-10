@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Inject, Module, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { readFile } from 'node:fs/promises';
 import { Pool } from 'pg';
@@ -20,7 +20,9 @@ export const PG_POOL = 'PG_POOL';
                     port: Number(url.port),
                     user: url.username,
                     database: url.pathname.slice(1),
-                    password: async () => (await readFile(passwordFile, 'utf8')).trim(),
+                    password: url.password
+                        ? decodeURIComponent(url.password)
+                        : async () => (await readFile(passwordFile, 'utf8')).trim(),
                     max: 5,
                 });
 
@@ -34,4 +36,10 @@ export const PG_POOL = 'PG_POOL';
     ],
     exports: [PG_POOL],
 })
-export class DatabaseModule {}
+export class DatabaseModule implements OnModuleDestroy {
+    constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+
+    async onModuleDestroy() {
+        await this.pool.end();
+    }
+}

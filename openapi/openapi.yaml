@@ -54,6 +54,10 @@ paths:
       responses:
         '200':
           description: The product is found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
         '404':
           description: The current product is unavailable
           content:
@@ -101,25 +105,31 @@ paths:
           application/json:
             schema:
               type: object
-              required: [items]
+              required: [buyerId, items]
               properties:
+                buyerId:
+                  type: integer
+                  minimum: 1
                 items:
                   type: array
                   minItems: 1
                   items:
                     type: object
+                    required: [productId, quantity]
+                    properties:
+                      productId:
+                        type: integer
+                        minimum: 1
+                      quantity:
+                        type: integer
+                        minimum: 1
       responses:
         '201':
           description: The order is created
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: integer
-                  items:
-                    type: array
+                $ref: '#/components/schemas/Order'
         '400':
           description: Invalid order data
           content:
@@ -139,6 +149,10 @@ paths:
       responses:
         '200':
           description: The order is found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
         '404':
           description: The current order is unavailable
           content:
@@ -147,6 +161,60 @@ paths:
                 $ref: '#/components/schemas/Problem'
 components:
   schemas:
+    Product:
+      type: object
+      required: [id, sellerId, sku, name, description, category, brand, price, stock]
+      properties:
+        id:
+          type: integer
+        sellerId:
+          type: integer
+        sku:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+        brand:
+          type: string
+        price:
+          type: integer
+          description: Ціна в мінорних одиницях (копійках)
+        stock:
+          type: integer
+    Order:
+      type: object
+      required: [id, buyerId, status, total, createdAt, items]
+      properties:
+        id:
+          type: integer
+        buyerId:
+          type: integer
+        status:
+          type: string
+          enum: [pending, paid, shipped, completed, cancelled, refunded]
+        total:
+          type: integer
+          description: Сума в мінорних одиницях (копійках)
+        createdAt:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            type: object
+            required: [productId, name, quantity, unitPrice]
+            properties:
+              productId:
+                type: integer
+              name:
+                type: string
+              quantity:
+                type: integer
+              unitPrice:
+                type: integer
     Problem:
       type: object
       required: [ type, title, status, detail, instance ]

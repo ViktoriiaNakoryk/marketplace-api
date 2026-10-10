@@ -55,6 +55,24 @@ describe('Orders (e2e)', () => {
         expect(read.body).toEqual(created.body);
     });
 
+    it('replays the same order for a repeated Idempotency-Key and rejects a different body with 422', async () => {
+        const { buyer, product } = await givenBuyerAndProduct();
+        const key = `e2e-idem-${Date.now()}`;
+        const body = { buyerId: buyer.id, items: [{ productId: product.id, quantity: 1 }] };
+        const post = (payload: object) =>
+            request(app.getHttpServer()).post('/orders').set('Idempotency-Key', key).send(payload);
+
+        const first = await post(body).expect(HttpStatus.CREATED);
+        const second = await post(body).expect(HttpStatus.CREATED);
+
+        expect(second.body.id).toBe(first.body.id);
+        expect(second.headers['idempotent-replayed']).toBe('true');
+        await post({ ...body, items: [{ productId: product.id, quantity: 5 }] }).expect(HttpStatus.UNPROCESSABLE_ENTITY);
+
+        const { rows } = await pool.query('SELECT count(*)::int AS n FROM orders WHERE "buyerId" = $1', [buyer.id]);
+        expect(rows[0].n).toBe(1);
+    });
+
     it('returns 404 for an order that does not exist', async () => {
         const res = await request(app.getHttpServer()).get('/orders/999999').expect(404);
 

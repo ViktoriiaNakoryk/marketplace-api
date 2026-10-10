@@ -41,7 +41,15 @@
     "demo:dlq": "bash scripts/with-secrets.sh dev node dist/demos/demo-dlq.js",
     "predemo:duplicate": "npm run -s build",
     "demo:duplicate": "bash scripts/with-secrets.sh dev node dist/demos/demo-duplicate.js",
-    "preconsumer": "npm run -s build"
+    "preconsumer": "npm run -s build",
+    "prerelay": "npm run -s build",
+    "relay": "bash scripts/with-secrets.sh dev node dist/relay.js",
+    "predemo:outbox": "npm run -s build",
+    "demo:outbox": "bash scripts/with-secrets.sh dev node dist/demos/demo-outbox.js",
+    "predemo:crash-write": "npm run -s build",
+    "demo:crash-write": "bash scripts/with-secrets.sh dev node dist/demos/demo-crash-write.js",
+    "predemo:crash-relay": "npm run -s build",
+    "demo:crash-relay": "bash scripts/with-secrets.sh dev node dist/demos/demo-crash-relay.js"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",

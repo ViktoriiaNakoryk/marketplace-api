@@ -21,9 +21,9 @@ export class InvalidEventError extends Error {
     }
 }
 
-export function orderPlacedEvent(order: OrderView): OrderPlacedEvent {
+export function toOrderPlacedEvent(order: OrderView, eventId: string): OrderPlacedEvent {
     return {
-        eventId: `order.placed:${order.id}`,
+        eventId,
         type: 'order.placed',
         version: 1,
         occurredAt: order.createdAt,

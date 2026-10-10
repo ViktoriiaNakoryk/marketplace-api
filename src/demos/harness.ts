@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { connect, type Channel, type ChannelModel } from 'amqplib';
 import { Pool } from 'pg';
 import { AppDataSource } from '../data-source';
-import { AmqpEventPublisher, type EventPublisher } from '../messaging/event-publisher';
+import { AmqpEventPublisher } from '../messaging/event-publisher';
 import { assertTopology, FULFILLMENT_DLQ, FULFILLMENT_QUEUE } from '../messaging/topology';
+import { relayBatch } from '../outbox/outbox-relay';
 import { OrderEventsService } from '../orders/order-events.service';
 import { OrdersRepository } from '../orders/orders.repository';
 import { OrdersService } from '../orders/orders.service';
@@ -14,7 +15,7 @@ import { UsersRepository } from '../users/users.repository';
 
 export type ConsumerLine = { kind: string } & Record<string, any>;
 
-export class DemoConsumer {
+export class DemoChild {
     readonly lines: ConsumerLine[] = [];
     readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
     private waiters: (() => void)[] = [];
@@ -95,6 +96,10 @@ export class Demo {
         const channel = await connection.createChannel();
         await assertTopology(channel);
 
+        const publisher = new AmqpEventPublisher(brokerUrl);
+        let flushed = 0;
+        for (let n = -1; n !== 0; flushed += n) n = await relayBatch(pool, publisher, { batchSize: 500 });
+
         const { consumerCount } = await channel.checkQueue(FULFILLMENT_QUEUE);
         if (consumerCount > 0) {
             throw new Error(`${FULFILLMENT_QUEUE} already has ${consumerCount} consumer(s) — stop npm run consumer first`);
@@ -102,20 +107,65 @@ export class Demo {
         await channel.purgeQueue(FULFILLMENT_QUEUE);
         await channel.purgeQueue(FULFILLMENT_DLQ);
 
-        console.log(`# ${name}: topology asserted, ${FULFILLMENT_QUEUE} and ${FULFILLMENT_DLQ} purged`);
-        return new Demo(name, pool, connection, channel, new AmqpEventPublisher(brokerUrl));
+        console.log(
+            `# ${name}: topology asserted, outbox flushed (${flushed} stale), ${FULFILLMENT_QUEUE} and ${FULFILLMENT_DLQ} purged`,
+        );
+        return new Demo(name, pool, connection, channel, publisher);
     }
 
-    spawnConsumer(env: Record<string, string> = {}): DemoConsumer {
-        const child = spawn(process.execPath, [join(__dirname, '..', 'consumer.js')], {
-            env: { ...process.env, CONSUMER_REPORT: 'json', ...env },
+    spawnConsumer(env: Record<string, string> = {}): DemoChild {
+        return this.spawnChild('consumer.js', { CONSUMER_REPORT: 'json', ...env });
+    }
+
+    spawnRelay(env: Record<string, string> = {}): DemoChild {
+        return this.spawnChild('relay.js', { RELAY_REPORT: 'json', RELAY_POLL_MS: '100', ...env });
+    }
+
+    private spawnChild(script: string, env: Record<string, string>): DemoChild {
+        const child = spawn(process.execPath, [join(__dirname, '..', script)], {
+            env: { ...process.env, ...env },
             stdio: ['ignore', 'pipe', 'inherit'],
         });
-        return new DemoConsumer(child);
+        return new DemoChild(child);
     }
 
-    ordersService(publisher: EventPublisher = this.publisher): OrdersService {
-        return new OrdersService(new OrdersRepository(this.pool), new OrderEventsService(), publisher);
+    ordersService(): OrdersService {
+        return new OrdersService(new OrdersRepository(this.pool), new OrderEventsService(), this.pool);
+    }
+
+    async relayAll(): Promise<number> {
+        let total = 0;
+        for (let n = -1; n !== 0; total += n) n = await relayBatch(this.pool, this.publisher);
+        return total;
+    }
+
+    async scalar(sql: string, params: unknown[] = []): Promise<number> {
+        const { rows } = await this.pool.query(sql, params);
+        return Number(rows[0]?.n ?? 0);
+    }
+
+    async outboxFor(orderIds: number[], published?: boolean): Promise<number> {
+        const filter = published === undefined ? '' : published ? 'AND published_at IS NOT NULL' : 'AND published_at IS NULL';
+        return this.scalar(
+            `SELECT count(*)::int AS n FROM outbox WHERE aggregatetype = 'order' AND aggregateid = ANY($1::text[]) ${filter}`,
+            [orderIds.map(String)],
+        );
+    }
+
+    async eventIdOf(orderId: number): Promise<string> {
+        const { rows } = await this.pool.query(
+            `SELECT id FROM outbox WHERE aggregatetype = 'order' AND aggregateid = $1`,
+            [String(orderId)],
+        );
+        return rows[0]?.id;
+    }
+
+    async processedFor(eventIds: string[]): Promise<number> {
+        return this.scalar(`SELECT count(*)::int AS n FROM processed_messages WHERE message_id = ANY($1::text[])`, [eventIds]);
+    }
+
+    async ordersOf(buyerId: number): Promise<number> {
+        return this.scalar(`SELECT count(*)::int AS n FROM orders WHERE "buyerId" = $1`, [buyerId]);
     }
 
     async givenCatalogue() {

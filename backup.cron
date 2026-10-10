@@ -1,0 +1,1 @@
+0 3 * * * cd /opt/marketplace-api && bash scripts/with-secrets.sh dev bash scripts/backup.sh >> /var/log/marketplace-backup.log 2>&1

@@ -7,3 +7,4 @@ spec.json
 .env
 secrets/
 .secrets/
+backups/

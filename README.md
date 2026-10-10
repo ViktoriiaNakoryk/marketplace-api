@@ -6,37 +6,245 @@
 і перевіряється при старті. Якщо якоїсь змінної бракує або вона зламана — застосунок
 **не запуститься** й напише, що саме не так. Краще впасти одразу, ніж на першому запиті в проді.
 
-### Які є змінні
-
-Повний список із прикладами лежить у файлі `.env.example`. Щоб почати — просто скопіюй його:
+Повний список із прикладами лежить у `.env.example`. Щоб почати — просто скопіюй його:
 
 ```bash
 cp .env.example .env
 ```
 
-Коротко про кожну:
+| Змінна             | Призначення                                                        | За замовч.            | Джерело значення |
+|--------------------|--------------------------------------------------------------------|-----------------------|------------------|
+| `PORT`             | порт HTTP-сервера                                                  | `3000`                | `.env`           |
+| `LOG_LEVEL`        | рівень логів: `debug`/`info`/`warn`/`error`                        | `info`                | `.env`           |
+| `DB_URL`           | рядок підключення до Postgres (без пароля)                         | —                     | **сховище секретів (ДЗ #11)** |
+| `DB_PASSWORD_FILE` | шлях до файла з паролем БД (пароль читається окремо, не з URL)     | `./secrets/db_password` | сховище секретів (ДЗ #11) |
 
-- **PORT** — на якому порту слухати HTTP (за замовчуванням `3000`).
-- **LOG_LEVEL** — рівень логів: `debug`, `info`, `warn` або `error` (за замовчуванням `info`).
-- **DB_URL** — рядок підключення до Postgres, напр. `postgres://appuser@localhost:5432/marketplace`.
-  Пароля тут **немає** — він читається окремо, з файла.
-- **DB_PASSWORD_FILE** — шлях до файла з паролем БД (за замовчуванням `./secrets/db_password`).
+`DB_URL` — це змінна підключення застосунку до бази. Її значення застосунок бере зі
+**сховища секретів, заведеного в ДЗ #11** (оточення `dev`/`prod`), а не з нового env-файла:
+`.env` у git не потрапляє (див. `.gitignore`), у репозиторії лежить лише `.env.example`
+з фейковим значенням. Пароль винесений в окремий файл навмисно — його можна ротувати
+«на живу», без перезапуску застосунку (`bash rotate.sh`).
 
-Пароль винесений у файл навмисно: так його можна змінювати «на живу», без перезапуску застосунку.
-
-Якщо додаси нову змінну в схему — не забудь дописати її і в `.env.example`. Перевірити, що вони
-не розійшлися, можна командою:
+Перевірити, що схема й `.env.example` не розійшлися:
 
 ```bash
 npm run check:env
 ```
 
-### Як запустити
+---
+
+## Конкурентність (ДЗ #14)
+
+Ключова операція `checkout` (`src/checkout.ts`) виконується в одній транзакції: атомарний
+декремент stock → списання балансу → INSERT замовлення + позиції → INSERT задачі на
+post-processing. Брак товару або коштів → відкат цілої транзакції (замовлень-«сиріт» немає).
+
+| Демо | Команда | Числа з моїх запусків |
+|------|---------|------------------------|
+| Гонка без oversell | `npm run demo:race` | 50 спроб → **10 успішних**, фінальний stock **0**, рядків із stock<0 — **0** |
+| Воркер-пул (SKIP LOCKED) | `npm run demo:workers` | 24 задачі / 3 воркери → **8/8/8**, оброблено двічі **0**, **389 ms** проти 960 ms послідовно |
+| Retry на serialization failure | `npm run demo:retry` | спіймано **1× `40001`** із повтором, фінальний balance **1200** (= 1000 + 2×100) |
+
+*(числа від запуску до запуску трохи «пливуть» — `random()` у backoff і планувальник; інваріанти сталі.)*
+
+### Pessimistic lock vs атомарний UPDATE
+
+Для checkout обрано **атомарний `UPDATE products SET stock = stock - n WHERE id = … AND stock >= n
+RETURNING`**, а не `SELECT … FOR UPDATE` + окремий UPDATE. Один statement поєднує перевірку, лок і
+запис — немає вікна між читанням і записом і немає read-modify-write у JS; повернуті 0 рядків
+означають «товару нема» — це і є перевірка, і лок водночас. `FOR UPDATE` тут коштував би зайвого
+раунд-тріпа з утриманням локу через застосунок. `FOR UPDATE SKIP LOCKED` натомість використано у
+воркері (`src/demo-workers.ts`), бо там задача — **захопити вільний рядок черги**, а не умовно
+списати лічильник.
+
+### Чому retry ловить лише два коди
+
+Обгортка повторює транзакцію тільки на `40001` (serialization_failure) і `40P01`
+(deadlock_detected) — це єдині **транзиторні** помилки, де повтор тієї самої транзакції має шанс
+пройти: Postgres прямо каже «ти програв конкурентну гонку, спробуй ще раз». Будь-яка інша помилка
+(порушення constraint, брак коштів, синтаксис, обрив зʼєднання) детермінована або бізнесова —
+повтор або впаде так само, або задвоїть побічний ефект. Тому ловимо саме два коди, а не `catch (e)`.
+
+---
+
+## ORM data layer (ДЗ #13)
+
+Схема з ДЗ #12 переїхала в TypeORM: entities + relations + міграції, `synchronize: false`.
+
+- **Головна таблиця:** `orders`. **Таблиця каталогу:** `products`.
+- Гроші — `integer` у **мінорних одиницях** (копійки): `price`, `total`, `unitPrice`; не float.
+- Початкова схема створюється **згенерованою міграцією** `src/migrations/*-InitialSchema.ts`
+  (прочитана; руками дописано тільки `CREATE INDEX … USING GIN ("searchVector")` — генератор
+  не емітить метод індексу). `down()` реально відкочує.
+
+### Команди
+
+Усі команди, що ходять у базу, загорнуті в обгортку секретів `scripts/with-secrets.sh dev …`
+(з ДЗ #11): у звичайному режимі вона підставляє `DB_*` зі сховища, у грейдера — режим
+`SKIP_VAULT=1` (див. [## Grading](#grading)).
+
+| Команда | Що робить |
+|---------|-----------|
+| `npm run build` | компіляція `tsc` у `dist/` |
+| `npm run migrate` | застосувати міграції |
+| `npm run migrate:show` | список міграцій (`[X]`/`[ ]`) |
+| `npm run migrate:revert` | відкотити останню міграцію |
+| `npm run seed` | детермінований ідемпотентний seed |
+| `npm run demo:nplus1` | демо N+1 «до/після» з лічильником запитів |
+| `npm run report` | звіт через `createQueryBuilder().getRawMany()` |
+
+### Seed — ідемпотентність
+
+`src/seed.ts` детермінований (жодного `random()`): на старті робить `TRUNCATE … RESTART IDENTITY
+CASCADE` і насіває фіксований набір, тож другий запуск не дублює рядків і не падає. Перевірка:
+
+```bash
+npm run seed && npm run seed
+docker compose exec -T db psql -U admin -d marketplace -Atc "SELECT 'users',count(*) FROM users UNION ALL SELECT 'products',count(*) FROM products UNION ALL SELECT 'orders',count(*) FROM orders UNION ALL SELECT 'order_items',count(*) FROM order_items;"
+```
+
+Після будь-якого запуску: `users=6`, `products=10`, `orders=8`, `order_items=17`.
+
+### N+1: до і після
+
+Граф `order → items → product`, вибірка з 8 замовлень / 17 позицій (`npm run demo:nplus1`):
+
+| Стратегія | Запитів |
+|-----------|---------|
+| наївно (запит на елемент у циклі) | **26** |
+| `relations` / `leftJoinAndSelect` (один JOIN) | **1** |
+| `relationLoadStrategy: 'query'` | **5** |
+
+«До» росте з розміром вибірки (`1 + orders + items`). «Після» — константа, що не залежить від N:
+JOIN дає 1 запит, а `'query'` дає `1 + 2 × рівнів` = 5 на два рівні зв'язків.
+
+### Repository vs QueryBuilder
+
+Межу проводжу за формою результату. `find()` / репозиторій — коли результат лягає в entity-графи
+(списки, картки, деталі «сутність + її зв'язки»). Щойно запит перестає повертати рядки таблиці —
+агрегати (`SUM`, `COUNT`), `GROUP BY`, кілька таблиць у плоский рядок — беру
+`createQueryBuilder().getRawMany()` (`src/report.ts`, «виторг по категоріях»): це вже звіт, а не
+сутність, і тягнути його через `find()` означало б довантажувати зайве й рахувати агрегати в JS.
+
+### Вибір onDelete
+
+| Зв'язок | onDelete | Чому |
+|---------|----------|------|
+| `order_items → orders` | **CASCADE** | позиції — частина замовлення, живуть і зникають разом із ним |
+| `order_items → products` | **RESTRICT** | не даємо видалити товар, поки він у історії замовлень |
+| `products → users` (продавець) | **RESTRICT** | продавця з товарами не видалити — захист історії |
+| `orders → users` (покупець) | **RESTRICT** | замовлення покупця — фінансова історія, її не осиротити |
+
+---
+
+## Grading
+
+Грейдер піднімає БД зі свіжого клону й доступу до сховища не має. `DB_*` беруться з дев-креденшелів
+`docker-compose.yml` (вони не секрет), а обгортка секретів пропускається через `SKIP_VAULT=1`:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:5432/marketplace
+export SKIP_VAULT=1
+```
+
+`DataSource` читає `DATABASE_URL` (а якщо його нема — окремі `DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME`),
+тож замість рядка вище можна експортувати й дискретні змінні:
+
+```bash
+export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+```
+
+Далі — стандартний конвеєр (ДЗ #13 + демо конкурентності ДЗ #14):
+
+```bash
+npm ci
+npx tsc --noEmit
+npm run build
+npm run migrate
+npm run migrate:show
+npm run migrate:revert
+npm run migrate
+npm run seed && npm run seed
+npm run demo:nplus1
+npm run report
+npm run demo:race
+npm run demo:workers
+npm run demo:retry
+```
+
+---
+
+## База даних та оптимізація (ДЗ #12)
+
+- **Головна таблиця обсягу:** `orders` (120 000 рядків).
+- **Таблиця пошуку (q4):** `products` (120 000 рядків).
+
+Дев-креденшели стенда живуть просто в `docker-compose.yml` (це не секрет — вони потрібні
+грейдеру на свіжому клоні): користувач `admin`, база `marketplace`.
+
+**Підняти базу** (одна команда, працює на свіжому клоні без правок файлів):
+
+```bash
+docker compose up -d --wait
+```
+
+**Підключитися** (одна команда):
+
+```bash
+docker compose exec db psql -U admin -d marketplace
+```
+
+### Повний цикл перевірки (як у грейдера)
+
+Порядок = чистий volume → схема → seed → EXPLAIN «до» (Seq Scan) → індекси → ANALYZE → EXPLAIN «після».
+
+```bash
+# 0. чистий стенд
+docker compose down -v && docker compose up -d --wait
+
+# 1. схема (генерована tsvector-колонка вже тут)
+docker compose exec -T db psql -U admin -d marketplace < db/schema.sql
+
+# 2. seed: ≥100 000 рядків + VACUUM (ANALYZE) в кінці
+docker compose exec -T db psql -U admin -d marketplace < db/seed.sql
+
+# 3. EXPLAIN «до» — кожен запит дає Seq Scan
+for q in q1 q2 q3 q4; do \
+  docker compose exec -T db psql -U admin -d marketplace \
+    -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/$q.sql)"; done
+
+# 4. індекси + оновлення статистики
+docker compose exec -T db psql -U admin -d marketplace < db/indexes.sql
+docker compose exec -T db psql -U admin -d marketplace -c "ANALYZE;"
+
+# 5. EXPLAIN «після» — індексний план, без Seq Scan
+#    (q4 прожени 2–3 рази й бери останній: перший після CREATE INDEX іде по холодному GIN)
+for q in q1 q2 q3 q4; do \
+  docker compose exec -T db psql -U admin -d marketplace \
+    -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/$q.sql)"; done
+```
+
+Повні виводи EXPLAIN до/після, пояснення до кожного запиту й секція **Морфологія** — у
+[`db/OPTIMIZATIONS.md`](db/OPTIMIZATIONS.md).
+
+| Файл | Призначення |
+|------|-------------|
+| `db/schema.sql`      | таблиці, констрейнти, генерована tsvector-колонка |
+| `db/seed.sql`        | генерація даних (≥100 000 рядків) + `VACUUM (ANALYZE)` |
+| `db/queries/q1..q3`  | реальні запити API (по одному statement) |
+| `db/queries/q4.sql`  | повнотекстовий пошук по каталогу |
+| `db/indexes.sql`     | усі індекси оптимізації, включно з GIN під q4 |
+| `db/OPTIMIZATIONS.md`| 4 пари EXPLAIN до/після + пояснення + Морфологія |
+
+---
+
+## Запуск застосунку
 
 1. Підняти базу:
 
    ```bash
-   docker compose up -d
+   docker compose up -d --wait
    ```
 
    Postgres сам створить користувача `appuser` через `init.sql`.

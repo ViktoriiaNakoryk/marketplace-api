@@ -5,6 +5,15 @@ import { Page, toPage } from '../common/page';
 
 export type OrderStatus = 'pending' | 'paid' | 'shipped' | 'completed' | 'cancelled' | 'refunded';
 
+export const ORDER_STATUSES: OrderStatus[] = ['pending', 'paid', 'shipped', 'completed', 'cancelled', 'refunded'];
+
+export type StatusChange = {
+    orderId: number;
+    buyerId: number;
+    status: OrderStatus;
+    previousStatus: OrderStatus;
+};
+
 export type NewOrder = {
     buyerId: number;
     items: { productId: number; quantity: number }[];
@@ -87,6 +96,24 @@ export class OrdersRepository {
         if (!rows[0]) return null;
         const items = (rows[0].items as OrderItemView[]).map((i) => ({ ...i, productId: Number(i.productId) }));
         return { ...toSummary(rows[0]), items };
+    }
+
+    async updateStatus(id: number, status: OrderStatus): Promise<StatusChange | null> {
+        const { rows } = await this.db.query(
+            `WITH prev AS (SELECT id, status FROM orders WHERE id = $1 FOR UPDATE)
+             UPDATE orders o SET status = $2
+             FROM prev
+             WHERE o.id = prev.id
+             RETURNING o.id, o."buyerId", o.status, prev.status AS "previousStatus"`,
+            [id, status],
+        );
+        if (!rows[0]) return null;
+        return {
+            orderId: Number(rows[0].id),
+            buyerId: Number(rows[0].buyerId),
+            status: rows[0].status as OrderStatus,
+            previousStatus: rows[0].previousStatus as OrderStatus,
+        };
     }
 
     async list(limit = 20, cursor?: string): Promise<Page<OrderSummary>> {

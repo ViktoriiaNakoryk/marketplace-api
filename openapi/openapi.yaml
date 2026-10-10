@@ -159,8 +159,95 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /orders/{id}/status:
+    patch:
+      operationId: changeOrderStatus
+      summary: Change the order status and notify subscribers (WebSocket room orders:{id} + SSE)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [pending, paid, shipped, completed, cancelled, refunded]
+      responses:
+        '200':
+          description: The status is changed; the published event is returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderStatusEvent'
+        '400':
+          description: Unknown status
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: The current order is unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /orders/{id}/events:
+    get:
+      operationId: streamOrderEvents
+      summary: Server-Sent Events stream of order status changes
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Replay buffered events with id greater than this value
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: "Event stream: `id: <n>`, `event: order.status`, `data: <OrderStatusEvent JSON>`"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          description: The current order is unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
 components:
   schemas:
+    OrderStatusEvent:
+      type: object
+      required: [id, orderId, status, previousStatus, changedAt]
+      properties:
+        id:
+          type: integer
+          description: Номер події в межах замовлення, зростає
+        orderId:
+          type: integer
+        status:
+          type: string
+          enum: [pending, paid, shipped, completed, cancelled, refunded]
+        previousStatus:
+          type: string
+          enum: [pending, paid, shipped, completed, cancelled, refunded]
+        changedAt:
+          type: string
+          format: date-time
     Product:
       type: object
       required: [id, sellerId, sku, name, description, category, brand, price, stock]

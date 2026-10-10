@@ -16,7 +16,7 @@ cp .env.example .env
 |--------------------|--------------------------------------------------------------------|-----------------------|------------------|
 | `PORT`             | порт HTTP-сервера                                                  | `3000`                | `.env`           |
 | `LOG_LEVEL`        | рівень логів: `debug`/`info`/`warn`/`error`                        | `info`                | `.env`           |
-| `DB_URL`           | рядок підключення до Postgres (без пароля)                         | —                     | **сховище секретів (ДЗ #11)** |
+| `DB_URL`           | рядок підключення через PgBouncer `:6432` (без пароля)                       | —                     | **сховище секретів (ДЗ #11)** |
 | `DB_PASSWORD_FILE` | шлях до файла з паролем БД (пароль читається окремо, не з URL)     | `./secrets/db_password` | сховище секретів (ДЗ #11) |
 
 `DB_URL` — це змінна підключення застосунку до бази. Її значення застосунок бере зі
@@ -30,6 +30,59 @@ cp .env.example .env
 ```bash
 npm run check:env
 ```
+
+---
+
+## Data layer ops (ДЗ #15)
+
+```
+застосунок / скрипти ──► pgbouncer:6432 (transaction pool, 10 серверних зʼєднань) ──► db:5432
+backup.sh ──► pg_dump -Fc напряму в db ──► backups/marketplace_YYYY-MM-DD_HHMMSS.dump
+restore-drill.sh ──► новий контейнер + новий volume ──► pg_restore ──► MATCH / exit 1
+```
+
+| Файл | Призначення |
+|------|-------------|
+| `pgbouncer/pgbouncer.ini` | `pool_mode = transaction`, `default_pool_size = 10`, `max_client_conn = 200`, `admin_users = admin`, `max_prepared_statements = 200` |
+| `pgbouncer/userlist.txt` | лише дев-пароль `admin` (той самий, що в compose); решту юзерів PgBouncer бере з `pg_shadow` через `auth_query` |
+| `scripts/backup.sh` | `pg_dump -Fc` → `backups/<db>_<дата>_<час>.dump`, перевіряє TOC через `pg_restore --list`, друкує шлях |
+| `scripts/restore-drill.sh` | останній дамп → чистий контейнер і volume → контрольні значення до/після → `MATCH` |
+| `backup.cron` | щоночі о 03:00 |
+| `RESTORE-DRILL.md` | протокол drill-у: дата, розмір, час, RTO/RPO |
+
+**Підняти.** `docker compose up -d --wait` піднімає `db` і `pgbouncer` (порт `6432` опублікований
+на хост). Рядок підключення у сховищі (оточення `dev`/`prod`) і контракт у `.env.example` вказують
+на `:6432`. `auth_query` потрібен, щоб ротація пароля `appuser` (`bash rotate.sh`) працювала й далі
+без правок `userlist.txt`.
+
+**Бекап.** `bash scripts/with-secrets.sh dev bash scripts/backup.sh`. Користувач/пароль/база
+беруться з `$DATABASE_URL`, але сам `pg_dump` іде напряму в Postgres (`docker compose exec db`),
+повз пулер: `pg_dump` виставляє session-level параметри до своєї транзакції, а transaction mode
+не гарантує, що наступні запити підуть у те саме серверне зʼєднання. Destination — локальна тека
+`backups/` поза контейнером (у `.gitignore`); `BACKUP_DIR=…` перевизначає її. Дамп пишеться
+у `*.partial` і перейменовується тільки після успішної перевірки TOC, тож drill ніколи не візьме
+обірваний файл.
+
+**Відновитись.** `bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh` — це водночас і
+процедура відновлення: скрипт створює чистий `postgres:16-alpine` з порожнім volume,
+робить `pg_restore --no-owner --no-acl --exit-on-error` і звіряє кількість рядків у кожній таблиці +
+`count|sum(total)` по `orders` з живою базою. На справжньому інциденті після `MATCH` перемикаємо
+`[databases]` у `pgbouncer.ini` (або `DATABASE_URL` у сховищі) на відновлений інстанс.
+Числа drill-у — у [`RESTORE-DRILL.md`](RESTORE-DRILL.md).
+
+**Чому transaction mode.** Серверне зʼєднання Postgres — це окремий процес із кількома МБ памʼяті,
+тож тисячі клієнтів (кілька інстансів застосунку × `poolSize` TypeORM) не можна тримати напряму.
+У transaction mode серверне зʼєднання видається клієнту лише на час транзакції, тому 200 клієнтів
+обслуговують 10 серверних зʼєднань. Ціна — все, що живе довше за транзакцію, ламається:
+**(1)** session-level `SET` (`search_path`, `statement_timeout`) «протікає» в чуже зʼєднання або губиться —
+тільки `SET LOCAL` усередині транзакції; **(2)** session-level advisory locks (`pg_advisory_lock`)
+можуть лишитися висіти на зʼєднанні, яке вже обслуговує іншого клієнта — тільки `pg_advisory_xact_lock`;
+**(3)** `LISTEN/NOTIFY` не працює — підписка привʼязана до сесії; **(4)** іменовані prepared statements
+(`PREPARE`, protocol-level) жили лише в одному серверному зʼєднанні — тут закрито
+`max_prepared_statements = 200` (PgBouncer ≥ 1.21), а `pg`/TypeORM і так шлють unnamed statements;
+**(5)** `WITH HOLD`-курсори й тимчасові таблиці між транзакціями. Код курсового нічого з цього не
+використовує (checkout, `SKIP LOCKED`-воркери й retry — усе в межах однієї транзакції), тому
+міграції, seed і всі демо ДЗ #14 проходять через PgBouncer без змін.
 
 ---
 
@@ -140,19 +193,20 @@ JOIN дає 1 запит, а `'query'` дає `1 + 2 × рівнів` = 5 на �
 ## Grading
 
 Грейдер піднімає БД зі свіжого клону й доступу до сховища не має. `DB_*` беруться з дев-креденшелів
-`docker-compose.yml` (вони не секрет), а обгортка секретів пропускається через `SKIP_VAULT=1`:
+`docker-compose.yml` (вони не секрет), а обгортка секретів пропускається через `SKIP_VAULT=1`.
+Застосунок і скрипти ходять у базу **через PgBouncer** (порт `6432`), не напряму в Postgres:
 
 ```bash
 docker compose up -d --wait
-export DATABASE_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:5432/marketplace
-export SKIP_VAULT=1
+export DATABASE_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:6432/marketplace
+export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 ```
 
 `DataSource` читає `DATABASE_URL` (а якщо його нема — окремі `DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME`),
 тож замість рядка вище можна експортувати й дискретні змінні:
 
 ```bash
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
 ```
 
 Далі — стандартний конвеєр (ДЗ #13 + демо конкурентності ДЗ #14):
@@ -171,6 +225,21 @@ npm run report
 npm run demo:race
 npm run demo:workers
 npm run demo:retry
+```
+
+Бекап і restore-drill (ДЗ #15). Обидва скрипти читають `$DATABASE_URL` з оточення; під
+`SKIP_VAULT=1` обгортка просто виконує `bash scripts/…`, тож досить `export` вище:
+
+```bash
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
+```
+
+Перевірки PgBouncer (потрібен `psql` на хості, пароль — `admin-bootstrap-only`):
+
+```bash
+psql -h 127.0.0.1 -p 6432 -U admin -d marketplace -c "SELECT 1"
+psql -h 127.0.0.1 -p 6432 -U admin -d pgbouncer -c "SHOW POOLS"
 ```
 
 ---

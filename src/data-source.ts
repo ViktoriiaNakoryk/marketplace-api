@@ -6,6 +6,7 @@ import { Product } from './entities/product.entity';
 import { Order } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
 import { Job } from './entities/job.entity';
+import { Fulfillment } from './entities/fulfillment.entity';
 
 const url = process.env.DATABASE_URL ?? process.env.DB_URL;
 
@@ -23,6 +24,6 @@ export const AppDataSource = new DataSource({
     synchronize: false,
     logging: false,
     poolSize: 60,
-    entities: [User, Product, Order, OrderItem, Job],
+    entities: [User, Product, Order, OrderItem, Job, Fulfillment],
     migrations: [join(__dirname, 'migrations', '*.js')],
 });

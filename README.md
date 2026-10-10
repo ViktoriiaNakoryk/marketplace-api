@@ -33,6 +33,166 @@ npm run check:env
 
 ---
 
+## Async-події через RabbitMQ (ДЗ #19)
+
+Між оформленням замовлення і тими, хто на нього реагує, тепер стоїть брокер, який зберігає подію,
+поки споживач не підтвердить обробку. Брокер — RabbitMQ `4.2.9-management` (LTS-серія 4.2,
+підтримка до 30.06.2030) у `docker-compose.yml`, healthcheck — `rabbitmq-diagnostics -q check_running`.
+Менеджмент-морда — http://localhost:15672 (`app` / `app`, дев-креденшели).
+
+```
+POST /orders ─► OrdersService.placeOrder ─► INSERT orders/order_items (COMMIT)
+                       │
+                       └─► confirm-канал: publish shop.events  [order.placed]  ─► waitForConfirms
+                                     │ (alternate-exchange → shop.events.unrouted, якщо binding не збігся)
+                                     ▼
+                     fulfillment.order-placed  (quorum, x-delivery-limit=5, x-dead-letter-exchange)
+                                     │ reject(requeue=false) / delivery-limit
+                                     ▼
+                     shop.events.dlx ─► fulfillment.order-placed.dlq
+```
+
+| Файл | Що там |
+|------|--------|
+| `src/messaging/topology.ts` | exchange `shop.events` (topic) + alternate exchange, черга, binding, DLX + DLQ |
+| `src/messaging/order-placed.event.ts` | контракт події і його валідація на боці споживача |
+| `src/messaging/event-publisher.ts` | confirm-канал (`createConfirmChannel` + `waitForConfirms`) |
+| `src/orders/orders.service.ts` | `placeOrder`: бізнес-операція → публікація `order.placed` |
+| `src/messaging/order-placed.consumer.ts` | споживач: `noAck: false`, `prefetch`, ack після ефекту, reject → DLQ |
+| `src/fulfillment/fulfillments.repository.ts` | ідемпотентний ефект: `INSERT … ON CONFLICT DO NOTHING` |
+| `src/consumer.ts` | окремий процес споживача (`npm run consumer`) |
+| `src/demos/*.ts` | три самоочисні демо |
+
+**Топологію оголошує споживач, а не продюсер.** `assertTopology()` викликає споживач при старті
+(і демо-обвʼязка як бутстрап-крок). Продюсер знає лише exchange `shop.events` і routing key
+`order.placed`. Подію, на яку ще немає binding-у, ловить alternate exchange
+`shop.events.unrouted`, тож позитивний confirm не означає мовчки викинутого повідомлення.
+
+**Контракт події** — окремий тип, а не ORM-сутність через spread:
+
+```json
+{ "eventId": "order.placed:42", "type": "order.placed", "version": 1, "occurredAt": "2026-10-10T15:38:59.355Z",
+  "data": { "orderId": 42, "buyerId": 4, "total": 249900, "currency": "UAH",
+            "items": [{ "productId": 1, "quantity": 1, "unitPrice": 249900 }] } }
+```
+
+`eventId` стабільний: виводиться з `orderId` (на одне замовлення одна подія `order.placed`), а
+`occurredAt` — це `createdAt` замовлення. Повторна публікація тієї самої події дає байт-у-байт той
+самий ідентифікатор, і споживач упізнає дубль. Він же йде в `messageId` AMQP-властивостей.
+
+**Споживач.** `noAck: false`; `ack` — лише після того, як ефект закомічено в Postgres. Невалідна
+подія (зламаний контракт) або порушення constraint класу `23xxx` — постійні помилки:
+`reject(requeue=false)` → DLX → DLQ з причиною `rejected`. Будь-яка інша помилка (наприклад, база
+недоступна) вважається транзиторною: `reject(requeue=true)`, і повторів не більше
+`x-delivery-limit = 5` (quorum-черга), після чого повідомлення теж іде в DLQ з причиною
+`delivery_limit`. Цей шлях налаштовано, але в демо показано лише `rejected`. Якщо брокер скасовує
+споживача (`basic.cancel`, `msg === null`) або рве зʼєднання, процес завершується з кодом 1: нехай
+його перезапустить супервізор, а не код шле `ack` у нікуди.
+
+**prefetch = 20.** Ефект — один `INSERT` через PgBouncer, у моїх прогонах **5–11 мс** на подію
+(`effect-avg-ms`). Отже `prefetch × час обробки = 20 × ~10 мс ≈ 0.2 с`, що на чотири порядки
+менше за `consumer_timeout` = 30 хв (1800 с). Навіть якщо обробка сповільниться до 1 с, це 20 с.
+При цьому 20, а не 0: другий екземпляр споживача отримає свою частку черги, а не простоюватиме,
+поки перший забрав усе. І не 1, бо при обробці за мілісекунди `prefetch=1` змушує чекати
+round-trip до брокера після кожного повідомлення.
+
+**Ідемпотентність.** Ефект — «завести відправлення під замовлення»: рядок у `fulfillments` з
+унікальними `eventId` та `orderId`. `INSERT … ON CONFLICT DO NOTHING RETURNING id` — природно
+ідемпотентна операція: повторна доставка вставляє 0 рядків, споживач рахує це як `skipped` і просто
+робить `ack`. Сховище дедупу — та сама таблиця в Postgres, тож воно переживає рестарт споживача й
+спільне для будь-якої кількості реплік (жодного `Set` у памʼяті).
+
+### Чому це at-least-once, а не exactly-once
+
+RabbitMQ не гарантує, що повідомлення буде доставлене рівно один раз: такої гарантії доставки немає
+ні в кого. Ack — це «я більше не вимагаю повтору», і він іде окремим кроком після ефекту. Якщо
+процес падає між закомітженим ефектом і ack, брокер чесно віддає повідомлення ще раз. Тому доставка
+в мене **at-least-once** (ручний ack після ефекту + `persistent` + quorum-черга + confirm-публікація),
+а **exactly-once результат** дає ідемпотентний ефект: вставка за унікальним ключем `eventId`/`orderId`,
+яка на дублі нічого не змінює. Довелося зробити дві речі: ack після ефекту (щоб не губити) і ефект,
+безпечний для повтору (щоб не подвоювати).
+
+Межі, які це ДЗ свідомо не закриває:
+
+- **База і брокер не атомарні.** `placeOrder` комітить замовлення, а потім публікує. Падіння між
+  ними дає замовлення без події; помилка публікації зараз лише логується. Це закриє transactional
+  outbox у ДЗ #22.
+- **Позначка «оброблено» і ефект.** Тут вони збігаються — це один і той самий рядок в одному
+  `INSERT`, тож щілини між ними немає. Але щойно ефект стане складнішим (кілька таблиць, зовнішній
+  виклик), позначку й ефект треба буде класти одним `COMMIT` у `processed_messages` (ДЗ #22).
+- **`dead-letter-strategy`.** Quorum-черга за замовчуванням dead-letter-ить в режимі `at-most-once`:
+  якщо DLQ недоступна, повідомлення може загубитись. `at-least-once` вмикається політикою, але працює
+  лише разом з `overflow: reject-publish`. Без нього брокер мовчки відкочується на `at-most-once`
+  і пише про це лише в лог. Для ДЗ лишила дефолт.
+
+### Демо
+
+Кожне демо саме проганяє міграції, оголошує топологію, чистить робочу чергу й DLQ, заводить власних
+покупця/товар, запускає споживача **окремим дочірнім процесом** (`dist/consumer.js`), друкує
+підсумок рядками `ключ=значення` і завершується з кодом 1, якщо інваріант порушено. Перед запуском
+зупини `npm run consumer`, якщо він працює: демо відмовиться стартувати, коли в черги вже є
+споживач.
+
+```bash
+npm run demo:publish
+npm run demo:dlq
+npm run demo:duplicate
+```
+
+**`demo:publish`** — 5 замовлень через `OrdersService.placeOrder`; мій прогін:
+
+```
+published=5
+delivered=5
+effect=5
+acked=5
+work=0
+dlq=0
+prefetch=20
+fulfillment-rows=5
+effect-avg-ms=5.05
+```
+
+**`demo:dlq`** — у `shop.events` іде отруєне повідомлення з `data.orderId: "not-a-number"`
+(імітація продюсера зі зламаним контрактом). Споживач робить `reject(requeue=false)`, повідомлення
+опиняється в DLQ, а причину демо читає з `x-first-death-reason` / `x-death[0].reason`:
+
+```
+rejected=1
+effect=0
+work=0
+dlq=1
+dlq-reason=rejected
+dlq-from-queue=fulfillment.order-placed
+dlq-message-id=poison-1791646699346
+```
+
+**`demo:duplicate`** — повторна доставка через **справжній `kill -9`**. Перший дочірній споживач
+запущений з `DEMO_CRASH_BEFORE_ACK=1`: він застосовує ефект і вбиває себе `SIGKILL` до ack. ОС
+закриває сокет, брокер бачить обрив зʼєднання і повертає неacked повідомлення в чергу. Другий,
+нормальний споживач отримує його з `redelivered=true`; `INSERT … ON CONFLICT` вставляє 0 рядків, і
+він робить ack:
+
+```
+deliveries=2
+effect=1
+skipped=1
+acked=1
+redelivered=1
+fulfillment-rows=1
+work=0
+dlq=0
+```
+
+Дві доставки, один ефект: at-least-once доставка + ідемпотентний ефект = exactly-once результат.
+
+**Секрети.** `BROKER_URL` лежить у сховищі ДЗ #11 поруч із `DATABASE_URL`, а всі три демо й
+`npm run consumer` запускаються через `bash scripts/with-secrets.sh dev …`. У `.env.example` —
+лише плейсхолдер `amqp://USER:PASSWORD@localhost:5672`. Застосунок без `BROKER_URL` стартує, але
+пише в лог, що `order.placed` не опубліковано.
+
+---
+
 ## Realtime (ДЗ #18)
 
 Подія «статус замовлення змінився» доходить до клієнта двома транспортами з однієї шини:
@@ -477,6 +637,20 @@ PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider
 ```
 
 Повна послідовність гейта `can-i-deploy` — у [«Гейт у роботі»](#гейт-у-роботі).
+
+RabbitMQ (ДЗ #19). Брокер піднімається тим самим `docker compose up -d --wait` (AMQP на `5672`,
+вебморда на `15672`). Демо самі проганяють міграції й чистять черги, тож досить цих рядків:
+
+```bash
+docker compose up -d --wait
+export BROKER_URL=amqp://app:app@127.0.0.1:5672
+export DATABASE_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:6432/marketplace
+export SKIP_VAULT=1    # у грейдера немає доступу до сховища
+npm ci
+npm run demo:publish
+npm run demo:dlq
+npm run demo:duplicate
+```
 
 Realtime (ДЗ #18): застосунок піднімається командами з [«Запуск і демо»](#запуск-і-демо)
 (`DB_URL` — дев-креденшели compose через PgBouncer), далі:

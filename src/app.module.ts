@@ -7,6 +7,7 @@ import {validate} from "./config/env.schema";
 import {ConfigModule} from "@nestjs/config";
 import {DatabaseModule} from "./database/database.module";
 import {HealthController} from "./health/health.controller";
+import { MessagingModule } from "./messaging/messaging.module";
 import { UsersRepository } from "./users/users.repository";
 import { ProductsRepository } from "./products/products.repository";
 import { OrdersRepository } from "./orders/orders.repository";
@@ -21,7 +22,8 @@ import { OrdersGateway } from "./orders/orders.gateway";
       validate,
       envFilePath: ['.env'],
     }),
-    DatabaseModule
+    DatabaseModule,
+    MessagingModule,
   ],
   controllers: [AppController, ProductsController, OrdersController, HealthController],
   providers: [

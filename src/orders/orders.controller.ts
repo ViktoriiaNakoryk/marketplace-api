@@ -58,7 +58,7 @@ export class OrdersController {
     async create(@Body() body: CreateOrderDto, @Headers('idempotency-key') idempotencyKey?: string) {
         if (!idempotencyKey) throw new BadRequestException('Idempotency-Key header is required');
         try {
-            const order = await this.orders.create(body);
+            const order = await this.ordersService.placeOrder(body);
             if (!order) throw new BadRequestException('Order references an unknown product');
             return order;
         } catch (e) {

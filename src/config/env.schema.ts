@@ -4,7 +4,8 @@ export const envSchema = z.object({
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
     DB_URL: z.url({ protocol: /^postgres$/ }),
     LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-    DB_PASSWORD_FILE: z.string().default('./secrets/db_password')
+    DB_PASSWORD_FILE: z.string().default('./secrets/db_password'),
+    BROKER_URL: z.url({ protocol: /^amqps?$/ }).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

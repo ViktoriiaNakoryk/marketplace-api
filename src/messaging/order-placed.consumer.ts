@@ -1,5 +1,5 @@
 import { connect, type ConsumeMessage } from 'amqplib';
-import type { Queryable } from '../database/queryable';
+import type { Pool } from 'pg';
 import { applyOrderPlaced } from '../fulfillment/fulfillments.repository';
 import { InvalidEventError, type OrderPlacedEvent, parseOrderPlaced } from './order-placed.event';
 import { assertTopology, FULFILLMENT_QUEUE } from './topology';
@@ -10,7 +10,7 @@ export type ConsumerReport = (line: { kind: string } & Record<string, unknown>) 
 
 export type ConsumerOptions = {
     brokerUrl: string;
-    db: Queryable;
+    db: Pool;
     prefetch?: number;
     report?: ConsumerReport;
     beforeAck?: (event: OrderPlacedEvent) => void;
@@ -60,15 +60,22 @@ export async function startOrderPlacedConsumer(opts: ConsumerOptions): Promise<{
 
         const started = performance.now();
         let applied: boolean;
+        let duplicate: boolean;
         try {
-            applied = await applyOrderPlaced(opts.db, event);
+            ({ applied, duplicate } = await applyOrderPlaced(opts.db, event));
         } catch (e) {
             const permanent = e instanceof InvalidEventError || isPermanentDbError(e);
             report({ kind: 'reject', requeue: !permanent, reason: (e as Error).message });
             channel.reject(msg, !permanent);
             return;
         }
-        report({ kind: 'effect', eventId: event.eventId, applied, ms: +(performance.now() - started).toFixed(2) });
+        report({
+            kind: 'effect',
+            eventId: event.eventId,
+            applied,
+            duplicate,
+            ms: +(performance.now() - started).toFixed(2),
+        });
 
         opts.beforeAck?.(event);
         channel.ack(msg);

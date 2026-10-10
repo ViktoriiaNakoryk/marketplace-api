@@ -33,6 +33,165 @@ npm run check:env
 
 ---
 
+## Outbox та ідемпотентність (ДЗ #22)
+
+Спільного `COMMIT` між Postgres і RabbitMQ не існує, тож оформлення замовлення більше не публікує
+в брокер саме. Воно пише подію в таблицю `outbox` **тією самою транзакцією**, що й замовлення, а
+назовні її виносить окремий процес-relay. Платимо за це at-least-once доставкою, тому ефект у
+споживача ідемпотентний на трьох рівнях.
+
+```
+POST /orders + Idempotency-Key
+  └─ BEGIN ─ INSERT idempotency_keys … ON CONFLICT DO NOTHING      (рівень 3: API-край)
+            INSERT orders + order_items                           (бізнес-запис)
+            INSERT outbox (id=eventId, payload=toOrderPlacedEvent) (подія)
+     COMMIT ─ один pool.connect()-клієнт, одна транзакція
+
+relay (npm run relay, окремий процес)
+  └─ BEGIN ─ SELECT … FROM outbox WHERE published_at IS NULL ORDER BY created_at, id
+                FOR UPDATE SKIP LOCKED LIMIT 50
+            для кожного: publish (confirm) ─► UPDATE published_at = now()
+     COMMIT
+
+consumer (npm run consumer)
+  └─ BEGIN ─ INSERT processed_messages (message_id, consumer) ON CONFLICT DO NOTHING   (рівень 2: inbox)
+            INSERT fulfillments … ON CONFLICT DO NOTHING                              (рівень 1: природний ключ)
+     COMMIT ─► ack
+```
+
+| Файл | Що там |
+|------|--------|
+| `src/migrations/*-AddOutboxInboxIdempotency.ts` | `outbox` + частковий індекс `WHERE published_at IS NULL`, `processed_messages`, `idempotency_keys` |
+| `src/orders/orders.service.ts` | `placeOrder`: ключ ідемпотентності + замовлення + outbox одним `COMMIT` |
+| `src/outbox/outbox-relay.ts`, `src/relay.ts` | relay-воркер на polling: `FOR UPDATE SKIP LOCKED` → publish → `UPDATE published_at` |
+| `src/fulfillment/fulfillments.repository.ts` | ефект + позначка в `processed_messages` в одній транзакції |
+| `src/demos/demo-outbox.ts`, `demo-crash-write.ts`, `demo-crash-relay.ts` | три самоочисні демо |
+
+**Таблиця `outbox`** (міграцією, не `synchronize`): `id uuid` (він же `eventId`), `aggregatetype`,
+`aggregateid`, `type`, `payload jsonb`, `created_at`, `published_at` (`NULL` = ще не винесено),
+`attempts`, `last_error`. `aggregatetype`/`aggregateid` названо канонічно для Debezium Outbox Event
+Router: `aggregatetype` — дефолтний `route.by.field`, `aggregateid` — ключ повідомлення, `id` —
+ідентифікатор події. Перехід на CDC не переписує консюмерів; `created_at`/`published_at`/`attempts`
+потрібні лише polling-relay. Під relay стоїть частковий індекс
+`(created_at, id) WHERE published_at IS NULL`: він містить лише невинесені рядки, тож лишається
+крихітним, хоч би як виросла таблиця.
+
+**Контракт події.** У `payload` іде результат явної функції `toOrderPlacedEvent(order, eventId)`
+(`eventId`, `type`, `version`, `occurredAt`, `data`), а не ORM-сутність, тож перейменування колонки
+в БД не ламає консюмерів.
+
+**Relay.** Саме `FOR UPDATE SKIP LOCKED`: два relay-и паралельно беруть різні рядки, а не стоять у
+черзі на один лок (голий `FOR UPDATE` дав би 0 дублів ціною нуля паралельності). Транзакція з локами
+тримається, поки публікується пачка, і `UPDATE published_at` іде після confirm-у кожної події.
+Невдала публікація інкрементує `attempts` і пише `last_error`, рядок лишається `NULL` і буде
+повторений наступним циклом. Курсор `id > last` тут не годиться: UUID не впорядкований, а
+`bigserial` видає номер на `nextval`, видимим же рядок стає на `COMMIT`, тож курсор пропускав би
+рядки. (Видно навіть у демо: невдала транзакція `demo:crash-write` спалила `orders.id = 11`, і
+наступне замовлення отримало `12`.) **Порядок доставки не гарантується:** `ORDER BY created_at, id`
+задає лише порядок вибірки, а `SKIP LOCKED` розкидає рядки між воркерами. Для `fulfillment` порядок
+не потрібен (кожна подія — окреме замовлення). Якщо колись знадобиться порядок у межах замовлення,
+його дасть лише партиціонування за `aggregateid`.
+
+**Чистка outbox.** Винесені рядки потрібні тільки для аудиту, тож план такий: нічна задача
+`DELETE FROM outbox WHERE published_at < now() - interval '7 days'` пачками по 10k, а при великих
+обсягах — партиціонування `outbox` за `created_at` і `DROP PARTITION` замість `DELETE`. Частковий
+індекс від цього не залежить, але чистка тримає під контролем bloat і розмір таблиці.
+
+**Ідемпотентність — три рівні.**
+
+1. **Природний ключ (ефект).** `INSERT INTO fulfillments … ON CONFLICT DO NOTHING`, де `orderId` і
+   `eventId` унікальні. Повтор нічого не змінює, на відміну від `UPDATE qty = qty - 1`.
+2. **Inbox.** `processed_messages (message_id, consumer)` з PK на обидва поля. Позначка й ефект
+   комітяться **однією транзакцією** на одному клієнті: падіння між ними відкочує обидва, тож «позначено,
+   а ефекту нема» неможливе. Позначка живе в тій самій Postgres, що й ефект, а не в Redis/памʼяті.
+3. **API-край.** `POST /orders` вимагає `Idempotency-Key` (з ДЗ #9), тепер із серверною механікою:
+   `INSERT INTO idempotency_keys … ON CONFLICT DO NOTHING` у тій самій транзакції, що й замовлення.
+   Другий запит з тим самим ключем повертає те саме замовлення з `201` і заголовком
+   `Idempotent-Replayed: true`. Конкурентний дубль чекає на unique-індексі, поки перший не закомітить,
+   і потім отримує replay. Ключ ідентифікує **намір**, а не тіло: два однакові тіла з різними ключами —
+   два легітимні замовлення. Хеш тіла (`request_fingerprint`) зберігається лише для захисту від
+   помилки клієнта: той самий ключ з іншим тілом → `422`.
+
+### Чому не можна поміняти місцями publish і UPDATE published_at
+
+Бо вибір тут між дублем і втратою. Порядок `publish → UPDATE`: якщо relay помре між ними, рядок
+лишиться `published_at IS NULL`, і наступний цикл опублікує подію вдруге. Це дубль, а дубль лікується
+дедупом на споживачі. Порядок `UPDATE → publish`: якщо relay помре (або publish впаде) після
+`UPDATE`, рядок уже позначено винесеним, а в брокер нічого не пішло, і ніхто його більше не
+підбере. Це втрата, а її не лікує нічого. До того ж помилка publish не означає «не доставлено»:
+загубитись могла лише відповідь брокера. Тому дедуп на споживачі обовʼязковий за будь-якого порядку,
+а правильний порядок — той, що зводить усі збої до дублів. Звідси формула: **at-least-once доставка +
+ідемпотентний ефект = exactly-once результат**. Exactly-once доставки не дає ні RabbitMQ, ні relay.
+
+### Демо
+
+Кожне демо проганяє міграції, оголошує топологію, виносить застарілі рядки outbox і чистить
+черги, заводить власних покупця/товар, запускає споживача (і в `crash-relay` — relay) **окремими
+дочірніми процесами**, друкує `ключ=число` і повертає `1`, якщо інваріант порушено. Перед запуском
+зупини `npm run consumer` / `npm run relay`, якщо вони працюють.
+
+```bash
+npm run demo:outbox
+npm run demo:crash-write
+npm run demo:crash-relay
+```
+
+**`demo:outbox`** — демо піднімає застосунок на випадковому порту і шле **два конкурентні**
+`POST /orders` з одним `Idempotency-Key`, далі relay, далі споживач:
+
+```
+# 2 concurrent POST /orders with Idempotency-Key …: 201, 201 (replayed) → order id(s) 10
+requests=2
+created=2
+replayed=1
+orders=1
+outbox=1
+outbox-pending-before-relay=1
+published=1
+deliveries=1
+effect=1
+processed=1
+fulfillment-rows=1
+```
+
+**`demo:crash-write`** — фейл бізнес-запису **змодельовано винятком** у тій самій транзакції, вже
+після `INSERT` в outbox і перед `COMMIT` (хук `afterOutboxWrite` у `placeOrder`). Усередині транзакції
+рядок outbox видно (`outbox-inside-tx=1`), а після падіння зникли і він, і замовлення, і ключ:
+
+```
+write-failed=1
+outbox-inside-tx=1
+orders=0
+outbox=0
+idempotency-keys=0
+published=0
+deliveries=0
+effect=0
+```
+
+**`demo:crash-relay`** ⭐ — **справжній `kill -9`**: перший relay-процес запущено з
+`DEMO_CRASH_AFTER_PUBLISH=1`, він публікує подію і вбиває себе `SIGKILL` рівно між publish і
+`UPDATE published_at`. Його транзакція не закомічена, тож рядок лишається `published_at IS NULL`, а
+лок звільняється разом з обірваним зʼєднанням. Другий relay публікує ту саму подію вдруге і
+комітить. Споживач отримує дві доставки: перша застосовує ефект, другу відсікає `processed_messages`:
+
+```
+published=2
+deliveries=2
+applied=1
+duplicates=1
+effect=1
+processed=1
+outbox-pending=0
+work=0
+dlq=0
+```
+
+**Секрети.** Підключення до бази й `BROKER_URL` — зі сховища ДЗ #11. Усі три демо, `npm run relay`
+і `npm run consumer` запускаються через `bash scripts/with-secrets.sh dev …`.
+
+---
+
 ## Async-події через RabbitMQ (ДЗ #19)
 
 Між оформленням замовлення і тими, хто на нього реагує, тепер стоїть брокер, який зберігає подію,
@@ -41,9 +200,9 @@ npm run check:env
 Менеджмент-морда — http://localhost:15672 (`app` / `app`, дев-креденшели).
 
 ```
-POST /orders ─► OrdersService.placeOrder ─► INSERT orders/order_items (COMMIT)
-                       │
-                       └─► confirm-канал: publish shop.events  [order.placed]  ─► waitForConfirms
+POST /orders ─► OrdersService.placeOrder ─► INSERT orders/order_items + outbox (один COMMIT, ДЗ #22)
+                                                       │
+           relay (npm run relay) ─► confirm-канал: publish shop.events  [order.placed]  ─► waitForConfirms
                                      │ (alternate-exchange → shop.events.unrouted, якщо binding не збігся)
                                      ▼
                      fulfillment.order-placed  (quorum, x-delivery-limit=5, x-dead-letter-exchange)
@@ -57,7 +216,7 @@ POST /orders ─► OrdersService.placeOrder ─► INSERT orders/order_items (C
 | `src/messaging/topology.ts` | exchange `shop.events` (topic) + alternate exchange, черга, binding, DLX + DLQ |
 | `src/messaging/order-placed.event.ts` | контракт події і його валідація на боці споживача |
 | `src/messaging/event-publisher.ts` | confirm-канал (`createConfirmChannel` + `waitForConfirms`) |
-| `src/orders/orders.service.ts` | `placeOrder`: бізнес-операція → публікація `order.placed` |
+| `src/orders/orders.service.ts` | `placeOrder`: бізнес-операція + рядок outbox (з ДЗ #22 публікує relay) |
 | `src/messaging/order-placed.consumer.ts` | споживач: `noAck: false`, `prefetch`, ack після ефекту, reject → DLQ |
 | `src/fulfillment/fulfillments.repository.ts` | ідемпотентний ефект: `INSERT … ON CONFLICT DO NOTHING` |
 | `src/consumer.ts` | окремий процес споживача (`npm run consumer`) |
@@ -71,14 +230,14 @@ POST /orders ─► OrdersService.placeOrder ─► INSERT orders/order_items (C
 **Контракт події** — окремий тип, а не ORM-сутність через spread:
 
 ```json
-{ "eventId": "order.placed:42", "type": "order.placed", "version": 1, "occurredAt": "2026-10-10T15:38:59.355Z",
+{ "eventId": "7317db28-ab6b-422b-9e93-58a4f597ea31", "type": "order.placed", "version": 1, "occurredAt": "2026-10-10T15:38:59.355Z",
   "data": { "orderId": 42, "buyerId": 4, "total": 249900, "currency": "UAH",
             "items": [{ "productId": 1, "quantity": 1, "unitPrice": 249900 }] } }
 ```
 
-`eventId` стабільний: виводиться з `orderId` (на одне замовлення одна подія `order.placed`), а
-`occurredAt` — це `createdAt` замовлення. Повторна публікація тієї самої події дає байт-у-байт той
-самий ідентифікатор, і споживач упізнає дубль. Він же йде в `messageId` AMQP-властивостей.
+`eventId` стабільний: з ДЗ #22 це `id` рядка outbox (UUID), який генерується один раз у транзакції
+замовлення і лежить у `payload`. Скільки б разів relay не публікував подію, ідентифікатор той самий,
+і споживач упізнає дубль. Він же йде в `messageId` AMQP-властивостей.
 
 **Споживач.** `noAck: false`; `ack` — лише після того, як ефект закомічено в Postgres. Невалідна
 подія (зламаний контракт) або порушення constraint класу `23xxx` — постійні помилки:
@@ -114,12 +273,11 @@ RabbitMQ не гарантує, що повідомлення буде дост�
 
 Межі, які це ДЗ свідомо не закриває:
 
-- **База і брокер не атомарні.** `placeOrder` комітить замовлення, а потім публікує. Падіння між
-  ними дає замовлення без події; помилка публікації зараз лише логується. Це закриє transactional
-  outbox у ДЗ #22.
-- **Позначка «оброблено» і ефект.** Тут вони збігаються — це один і той самий рядок в одному
-  `INSERT`, тож щілини між ними немає. Але щойно ефект стане складнішим (кілька таблиць, зовнішній
-  виклик), позначку й ефект треба буде класти одним `COMMIT` у `processed_messages` (ДЗ #22).
+- **База і брокер не атомарні.** У ДЗ #19 `placeOrder` комітив замовлення, а потім публікував, і
+  падіння між ними давало замовлення без події. **Закрито в ДЗ #22** transactional outbox-ом (див.
+  [«Outbox та ідемпотентність»](#outbox-та-ідемпотентність-дз-22)).
+- **Позначка «оброблено» і ефект.** У ДЗ #19 вони збігались (один рядок в одному `INSERT`). З ДЗ #22
+  позначка в `processed_messages` і ефект комітяться однією транзакцією.
 - **`dead-letter-strategy`.** Quorum-черга за замовчуванням dead-letter-ить в режимі `at-most-once`:
   якщо DLQ недоступна, повідомлення може загубитись. `at-least-once` вмикається політикою, але працює
   лише разом з `overflow: reject-publish`. Без нього брокер мовчки відкочується на `at-most-once`
@@ -188,8 +346,8 @@ dlq=0
 
 **Секрети.** `BROKER_URL` лежить у сховищі ДЗ #11 поруч із `DATABASE_URL`, а всі три демо й
 `npm run consumer` запускаються через `bash scripts/with-secrets.sh dev …`. У `.env.example` —
-лише плейсхолдер `amqp://USER:PASSWORD@localhost:5672`. Застосунок без `BROKER_URL` стартує, але
-пише в лог, що `order.placed` не опубліковано.
+лише плейсхолдер `amqp://USER:PASSWORD@localhost:5672`. З ДЗ #22 застосунок у брокер не ходить
+узагалі: подію публікує окремий процес `npm run relay`.
 
 ---
 
@@ -637,6 +795,20 @@ PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider
 ```
 
 Повна послідовність гейта `can-i-deploy` — у [«Гейт у роботі»](#гейт-у-роботі).
+
+Outbox (ДЗ #22). Брокер — RabbitMQ з compose (AMQP на `5672`), база — через PgBouncer. Демо самі
+проганяють міграції, тож досить цих рядків:
+
+```bash
+docker compose up -d --wait
+export DATABASE_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:6432/marketplace
+export BROKER_URL=amqp://app:app@127.0.0.1:5672
+export SKIP_VAULT=1    # у грейдера немає доступу до сховища
+npm ci
+npm run demo:outbox
+npm run demo:crash-write
+npm run demo:crash-relay
+```
 
 RabbitMQ (ДЗ #19). Брокер піднімається тим самим `docker compose up -d --wait` (AMQP на `5672`,
 вебморда на `15672`). Демо самі проганяють міграції й чистять черги, тож досить цих рядків:

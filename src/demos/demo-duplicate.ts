@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { run, Demo } from './harness';
 import { FULFILLMENT_DLQ, FULFILLMENT_QUEUE } from '../messaging/topology';
 
@@ -8,8 +9,13 @@ run(async () => {
     const crashing = demo.spawnConsumer({ DEMO_CRASH_BEFORE_ACK: '1' });
     await crashing.waitFor(() => crashing.prefetch > 0, 'crashing consumer ready');
 
-    const order = await demo.ordersService().placeOrder({ buyerId: buyer.id, items: [{ productId: product.id, quantity: 1 }] });
-    const eventId = `order.placed:${order!.id}`;
+    const placed = await demo.ordersService().placeOrder(
+        { buyerId: buyer.id, items: [{ productId: product.id, quantity: 1 }] },
+        randomUUID(),
+    );
+    const order = placed!.order;
+    const eventId = await demo.eventIdOf(order.id);
+    await demo.relayAll();
 
     const crash = await crashing.exited;
     console.log(`# consumer #1 applied the effect and died before ack (signal ${crash.signal})`);
@@ -29,7 +35,7 @@ run(async () => {
         skipped: count('effect', (l) => !l.applied),
         acked: count('ack'),
         redelivered: redelivery?.redelivered ? 1 : 0,
-        'fulfillment-rows': await demo.fulfillmentsFor([order!.id]),
+        'fulfillment-rows': await demo.fulfillmentsFor([order.id]),
         work: await demo.depth(FULFILLMENT_QUEUE, 0),
         dlq: await demo.depth(FULFILLMENT_DLQ, 0),
     };

@@ -125,13 +125,25 @@ paths:
                         minimum: 1
       responses:
         '201':
-          description: The order is created
+          description: The order is created, or replayed for a repeated Idempotency-Key
+          headers:
+            Idempotent-Replayed:
+              description: "true when the response replays an order created earlier with the same key"
+              schema:
+                type: string
+                enum: ['true']
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
         '400':
           description: Invalid order data
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The Idempotency-Key was already used with a different request body
           content:
             application/problem+json:
               schema:

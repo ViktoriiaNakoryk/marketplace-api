@@ -1,5 +1,5 @@
 import { run, Demo } from './harness';
-import type { EventPublisher } from '../messaging/event-publisher';
+import { randomUUID } from 'node:crypto';
 import { FULFILLMENT_DLQ, FULFILLMENT_QUEUE } from '../messaging/topology';
 
 const EVENTS = 5;
@@ -9,22 +9,17 @@ run(async () => {
     const consumer = demo.spawnConsumer();
     await consumer.waitFor(() => consumer.prefetch > 0, 'consumer ready');
 
-    let published = 0;
-    const counting: EventPublisher = {
-        publish: async (key, event) => {
-            await demo.publisher.publish(key, event);
-            published++;
-        },
-        close: async () => undefined,
-    };
-
     const { buyer, product } = await demo.givenCatalogue();
-    const orders = demo.ordersService(counting);
+    const orders = demo.ordersService();
     const orderIds: number[] = [];
     for (let i = 0; i < EVENTS; i++) {
-        const order = await orders.placeOrder({ buyerId: buyer.id, items: [{ productId: product.id, quantity: 1 }] });
-        orderIds.push(order!.id);
+        const placed = await orders.placeOrder(
+            { buyerId: buyer.id, items: [{ productId: product.id, quantity: 1 }] },
+            randomUUID(),
+        );
+        orderIds.push(placed!.order.id);
     }
+    const published = await demo.relayAll();
 
     await consumer.waitFor(() => consumer.count('ack') >= EVENTS, `${EVENTS} acks`);
     await consumer.stop();

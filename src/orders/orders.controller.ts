@@ -55,12 +55,17 @@ export class OrdersController {
 
     @Post()
     @HttpCode(201)
-    async create(@Body() body: CreateOrderDto, @Headers('idempotency-key') idempotencyKey?: string) {
+    async create(
+        @Body() body: CreateOrderDto,
+        @Res({ passthrough: true }) res: Response,
+        @Headers('idempotency-key') idempotencyKey?: string,
+    ) {
         if (!idempotencyKey) throw new BadRequestException('Idempotency-Key header is required');
         try {
-            const order = await this.ordersService.placeOrder(body);
-            if (!order) throw new BadRequestException('Order references an unknown product');
-            return order;
+            const result = await this.ordersService.placeOrder(body, idempotencyKey);
+            if (!result) throw new BadRequestException('Order references an unknown product');
+            if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');
+            return result.order;
         } catch (e) {
             if ((e as { code?: string }).code === '23503') {
                 throw new BadRequestException(`Buyer ${body.buyerId} does not exist`);

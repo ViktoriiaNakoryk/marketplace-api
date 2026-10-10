@@ -33,6 +33,118 @@ npm run check:env
 
 ---
 
+## Realtime (ДЗ #18)
+
+Подія «статус замовлення змінився» доходить до клієнта двома транспортами з однієї шини:
+
+```
+PATCH /orders/:id/status ─► OrdersService.changeStatus ─► OrdersRepository.updateStatus (UPDATE … RETURNING)
+                                         │
+                                         ▼
+                         OrderEventsService (Subject + буфер останніх 100 подій на замовлення)
+                           ├─► OrdersGateway ─► server.to('orders:<id>').emit('order.status', …)   (socket.io)
+                           └─► GET /orders/:id/events ─► text/event-stream з id: / event: / data:   (SSE)
+```
+
+| Файл | Призначення |
+|------|-------------|
+| `src/orders/order-events.service.ts` | шина подій (`Subject`), лічильник `id` на замовлення, буфер для `Last-Event-ID` |
+| `src/orders/orders.service.ts` | бізнес-логіка зміни статусу: оновлення в БД → `publish` у шину |
+| `src/orders/orders.gateway.ts` | `join` → перевірка власника → кімната `orders:<id>`; релей шини в кімнату |
+| `src/orders/orders.controller.ts` | `PATCH /orders/:id/status`, `GET /orders/:id/events` (SSE) |
+| `scripts/realtime-demo.mjs` | headless-демо ізоляції кімнат + контрольний режим `--same-room` |
+
+**WebSocket.** Клієнт підключається з `auth: { userId }` у handshake (заглушка замість JWT, поки
+в курсовому немає автентифікації) і шле `join` з `{ orderId }`. Ack — `{ ok: true, room }` або
+`{ ok: false, error }`: `UNAUTHORIZED` для анонімного сокета, `FORBIDDEN` для чужого або
+неіснуючого замовлення (існування чужих замовлень не розкриваємо). Емісія йде лише в кімнату
+`orders:<id>`, не всім.
+
+**SSE.** `GET /orders/:id/events` одразу шле `retry: 1000` (клієнт реконектиться за секунду), далі
+кожна подія — блок `id: <n>`, `event: order.status`, `data: {…JSON зі статусом…}`; кожні 15 с
+коментар `: ping` тримає зʼєднання крізь проксі. `id` зростає в межах замовлення. Клієнт із
+`Last-Event-ID: N` спершу отримує з буфера пропущені події з `id > N`, потім живий потік без дублів
+(реплей і підписка відбуваються в одному тіку). Неіснуюче замовлення → `404`.
+
+### Запуск і демо
+
+```bash
+docker compose up -d --wait
+export DB_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:6432/marketplace
+export DATABASE_URL=$DB_URL SKIP_VAULT=1
+npm ci
+npm run build
+npm run migrate
+npm run seed
+node dist/main.js
+```
+
+В іншому терміналі (застосунок на `http://localhost:3000`; `BASE_URL=…` перевизначає адресу):
+
+```bash
+node scripts/realtime-demo.mjs; echo "exit=$?"
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+```
+
+Скрипт бере з `GET /orders` два замовлення різних покупців (A і B), підключає двох клієнтів,
+чекає ack від `join`, потім через `PATCH` міняє статус A і через 1.5 с друкує, хто що почув.
+Основний прогін: клієнти в різних кімнатах, очікування `B_RECEIVED=0`. З `--same-room` клієнт B
+заходить у кімнату A тим самим кодом (від імені власника A), і успіх — `B_RECEIVED=1`. Додатково
+друкується `FOREIGN_JOIN=FORBIDDEN`: покупець B пробує зайти в кімнату чужого замовлення A і
+отримує відмову. Мій прогін:
+
+```
+demo: A=user 4 in orders:1, B=user 5 in orders:2
+FOREIGN_JOIN=FORBIDDEN
+demo: order 1 paid → shipped (event id 6)
+A_RECEIVED=1
+B_RECEIVED=0
+exit=0
+
+demo: A=user 4 in orders:1, B=user 4 in orders:1 (--same-room)
+FOREIGN_JOIN=FORBIDDEN
+demo: order 1 shipped → paid (event id 7)
+A_RECEIVED=1
+B_RECEIVED=1
+exit=0
+```
+
+SSE руками:
+
+```bash
+curl -sN http://localhost:3000/orders/1/events
+for s in paid shipped completed refunded; do
+  curl -s -X PATCH localhost:3000/orders/1/status -H 'Content-Type: application/json' -d "{\"status\":\"$s\"}"; echo
+done
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/1/events | grep '^id:'
+```
+
+**Два інстанси й більше.** Кімнати й буфер подій живуть у памʼяті процесу: якщо `PATCH` прийде на
+інстанс 1, а сокет покупця підключений до інстанса 2, `server.to('orders:<id>')` на інстансі 1
+нікого не знайде, і подія загубиться (так само SSE-клієнт на інстансі 2 і його `Last-Event-ID`
+не побачать подію з інстанса 1). Лікується `@socket.io/redis-adapter`, який розсилає емісії в
+кімнати через Redis pub/sub між усіма інстансами (плюс sticky sessions для long-polling), а
+буфер для SSE виноситься в спільне сховище (Redis Streams).
+
+## Trade-offs: WebSocket vs SSE
+
+Для нотифікацій про статус замовлення в проді я лишила б **SSE**. Потік односпрямований
+(сервер → покупець), а SSE дає реконект і догравання пропущеного через `Last-Event-ID` з коробки
+браузера, ходить звичайним HTTP крізь будь-які проксі та балансувальники і не тягне окремого
+протоколу й клієнтської бібліотеки. WebSocket варто брати, коли зʼявиться справжній двосторонній
+обмін (чат продавця з покупцем, live-торги).
+
+| Критерій | WebSocket (socket.io) | SSE |
+|----------|-----------------------|-----|
+| Напрям каналу | двосторонній: клієнт шле `join`, ack, будь-які події | односпрямований сервер → клієнт; команди клієнта — окремими HTTP-запитами |
+| Реконект і відновлення | реконект робить socket.io-client (events на `socket.io` manager-і), але пропущені за час обриву події втрачені — догравання треба писати самому | `EventSource` реконектиться сам через `retry:` і шле `Last-Event-ID`; сервер доганяє з буфера — у нас це вже працює |
+| Вимоги до інфраструктури | Upgrade-handshake, проксі мають пропускати `Upgrade`/`Connection`; для кількох інстансів — Redis-адаптер і sticky sessions | звичайна довга HTTP-відповідь: працює крізь будь-який HTTP-проксі/CDN (треба лише вимкнути буферизацію, `X-Accel-Buffering: no`); на HTTP/1.1 ліміт ~6 зʼєднань на домен у браузері, на HTTP/2 зникає |
+| Ціна на подію | малий фрейм (2–14 байт заголовка) + пакет socket.io (`42["order.status",{…}]`) | текстовий блок `id:`/`event:`/`data:` (десятки байт службового тексту), лише UTF-8, бінарне — через base64 |
+| Авторизація | токен у handshake (`auth`), перевірка на `join` | звичайні cookie/заголовки HTTP; нативний `EventSource` не вміє кастомні заголовки — лише cookie або токен у query |
+| Клієнт | потрібна бібліотека socket.io-client (протокол socket.io ≠ голий WebSocket) | вбудований у браузер `EventSource`, у CLI достатньо `curl -N` |
+
+---
+
 ## Тестування (ДЗ #16)
 
 «Драбинка довіри»: unit → integration проти справжнього Postgres → E2E усього Nest-застосунку →
@@ -365,6 +477,15 @@ PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider
 ```
 
 Повна послідовність гейта `can-i-deploy` — у [«Гейт у роботі»](#гейт-у-роботі).
+
+Realtime (ДЗ #18): застосунок піднімається командами з [«Запуск і демо»](#запуск-і-демо)
+(`DB_URL` — дев-креденшели compose через PgBouncer), далі:
+
+```bash
+curl -sN --max-time 2 -D - -o /dev/null http://localhost:3000/orders/1/events | grep -i '^content-type'
+node scripts/realtime-demo.mjs; echo "exit=$?"
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+```
 
 ---
 

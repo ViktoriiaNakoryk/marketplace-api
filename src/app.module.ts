@@ -10,6 +10,9 @@ import {HealthController} from "./health/health.controller";
 import { UsersRepository } from "./users/users.repository";
 import { ProductsRepository } from "./products/products.repository";
 import { OrdersRepository } from "./orders/orders.repository";
+import { OrdersService } from "./orders/orders.service";
+import { OrderEventsService } from "./orders/order-events.service";
+import { OrdersGateway } from "./orders/orders.gateway";
 
 @Module({
   imports: [
@@ -21,6 +24,14 @@ import { OrdersRepository } from "./orders/orders.repository";
     DatabaseModule
   ],
   controllers: [AppController, ProductsController, OrdersController, HealthController],
-  providers: [AppService, UsersRepository, ProductsRepository, OrdersRepository],
+  providers: [
+    AppService,
+    UsersRepository,
+    ProductsRepository,
+    OrdersRepository,
+    OrderEventsService,
+    OrdersService,
+    OrdersGateway,
+  ],
 })
 export class AppModule {}

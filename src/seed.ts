@@ -66,7 +66,9 @@ async function main(): Promise<void> {
     await AppDataSource.transaction(async (manager) => {
         await manager.query('TRUNCATE TABLE "order_items", "orders", "products", "users" RESTART IDENTITY CASCADE');
 
-        const users = await manager.getRepository(User).save(userSpecs);
+        const users = await manager.getRepository(User).save(
+            userSpecs.map((u) => ({ ...u, balance: '100000000' })),
+        );
 
         const products = await manager.getRepository(Product).save(
             productSpecs.map((p) => ({
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
                 category: p.category,
                 brand: p.brand,
                 price: p.price,
+                stock: 25,
             })),
         );
 

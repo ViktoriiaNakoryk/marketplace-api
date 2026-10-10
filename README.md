@@ -33,6 +33,40 @@ npm run check:env
 
 ---
 
+## Конкурентність (ДЗ #14)
+
+Ключова операція `checkout` (`src/checkout.ts`) виконується в одній транзакції: атомарний
+декремент stock → списання балансу → INSERT замовлення + позиції → INSERT задачі на
+post-processing. Брак товару або коштів → відкат цілої транзакції (замовлень-«сиріт» немає).
+
+| Демо | Команда | Числа з моїх запусків |
+|------|---------|------------------------|
+| Гонка без oversell | `npm run demo:race` | 50 спроб → **10 успішних**, фінальний stock **0**, рядків із stock<0 — **0** |
+| Воркер-пул (SKIP LOCKED) | `npm run demo:workers` | 24 задачі / 3 воркери → **8/8/8**, оброблено двічі **0**, **389 ms** проти 960 ms послідовно |
+| Retry на serialization failure | `npm run demo:retry` | спіймано **1× `40001`** із повтором, фінальний balance **1200** (= 1000 + 2×100) |
+
+*(числа від запуску до запуску трохи «пливуть» — `random()` у backoff і планувальник; інваріанти сталі.)*
+
+### Pessimistic lock vs атомарний UPDATE
+
+Для checkout обрано **атомарний `UPDATE products SET stock = stock - n WHERE id = … AND stock >= n
+RETURNING`**, а не `SELECT … FOR UPDATE` + окремий UPDATE. Один statement поєднує перевірку, лок і
+запис — немає вікна між читанням і записом і немає read-modify-write у JS; повернуті 0 рядків
+означають «товару нема» — це і є перевірка, і лок водночас. `FOR UPDATE` тут коштував би зайвого
+раунд-тріпа з утриманням локу через застосунок. `FOR UPDATE SKIP LOCKED` натомість використано у
+воркері (`src/demo-workers.ts`), бо там задача — **захопити вільний рядок черги**, а не умовно
+списати лічильник.
+
+### Чому retry ловить лише два коди
+
+Обгортка повторює транзакцію тільки на `40001` (serialization_failure) і `40P01`
+(deadlock_detected) — це єдині **транзиторні** помилки, де повтор тієї самої транзакції має шанс
+пройти: Postgres прямо каже «ти програв конкурентну гонку, спробуй ще раз». Будь-яка інша помилка
+(порушення constraint, брак коштів, синтаксис, обрив зʼєднання) детермінована або бізнесова —
+повтор або впаде так само, або задвоїть побічний ефект. Тому ловимо саме два коди, а не `catch (e)`.
+
+---
+
 ## ORM data layer (ДЗ #13)
 
 Схема з ДЗ #12 переїхала в TypeORM: entities + relations + міграції, `synchronize: false`.
@@ -110,11 +144,18 @@ JOIN дає 1 запит, а `'query'` дає `1 + 2 × рівнів` = 5 на �
 
 ```bash
 docker compose up -d --wait
-export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+export DATABASE_URL=postgres://admin:admin-bootstrap-only@127.0.0.1:5432/marketplace
 export SKIP_VAULT=1
 ```
 
-Далі — стандартний конвеєр:
+`DataSource` читає `DATABASE_URL` (а якщо його нема — окремі `DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME`),
+тож замість рядка вище можна експортувати й дискретні змінні:
+
+```bash
+export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+```
+
+Далі — стандартний конвеєр (ДЗ #13 + демо конкурентності ДЗ #14):
 
 ```bash
 npm ci
@@ -127,6 +168,9 @@ npm run migrate
 npm run seed && npm run seed
 npm run demo:nplus1
 npm run report
+npm run demo:race
+npm run demo:workers
+npm run demo:retry
 ```
 
 ---

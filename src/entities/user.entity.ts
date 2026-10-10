@@ -11,6 +11,7 @@ import { Order } from './order.entity';
 
 @Entity('users')
 @Check(`"role" IN ('buyer', 'seller', 'admin')`)
+@Check(`"balance" >= 0`)
 export class User {
     @PrimaryGeneratedColumn({ type: 'bigint' })
     id: string;
@@ -23,6 +24,9 @@ export class User {
 
     @Column({ type: 'text', default: 'buyer' })
     role: 'buyer' | 'seller' | 'admin';
+
+    @Column({ type: 'bigint', default: 0 })
+    balance: string;
 
     @CreateDateColumn({ type: 'timestamptz' })
     createdAt: Date;

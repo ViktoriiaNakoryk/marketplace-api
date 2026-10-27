@@ -1,8 +1,11 @@
-import { Controller, Get, Inject, NotFoundException, Optional, Param, ParseIntPipe, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, NotFoundException, Optional, Param, ParseIntPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { CurrentUser, JwtAuthGuard, Roles, RolesGuard } from '../auth/guards';
+import type { AccessClaims } from '../auth/token.service';
 import type Redis from 'ioredis';
 import { PageQueryDto } from '../common/page';
 import { CACHE_REDIS } from '../redis/redis.module';
 import { ProductCardCache } from './product-card.cache';
+import { CreateProductDto } from './create-product.dto';
 import { ProductsRepository } from './products.repository';
 
 @Controller('products')
@@ -19,6 +22,14 @@ export class ProductsController {
     @Get()
     findAll(@Query() query: PageQueryDto) {
         return this.products.list(query.limit, query.cursor);
+    }
+
+    @Post()
+    @HttpCode(201)
+    @UseGuards(JwtAuthGuard, RolesGuard)
+    @Roles('seller', 'admin')
+    create(@Body() body: CreateProductDto, @CurrentUser() user: AccessClaims) {
+        return this.products.create({ ...body, sellerId: user.sub });
     }
 
     @Get(':id')

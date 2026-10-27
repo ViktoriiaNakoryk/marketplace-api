@@ -1,12 +1,14 @@
 import { execSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { Verifier, VerifierOptions } from '@pact-foundation/pact';
 import { Pool } from 'pg';
 import { AppModule } from '../../src/app.module';
+import { TokenService } from '../../src/auth/token.service';
 import { configureApp } from '../../src/app.setup';
 import { PACT_FILE, PROVIDER } from './pact.config';
-import { stateHandlers } from './provider-states';
+import { BUYER_ID, stateHandlers } from './provider-states';
 
 function git(cmd: string, fallback: string): string {
     try {
@@ -42,6 +44,11 @@ describe('Pact verification: marketplace-api', () => {
             providerVersion,
             providerVersionBranch: process.env.PACT_PROVIDER_BRANCH || git('rev-parse --abbrev-ref HEAD', 'local'),
             stateHandlers: stateHandlers(pool),
+            requestFilter: (req, _res, next) => {
+                const token = app.get(TokenService).sign({ id: BUYER_ID, role: 'buyer' }, randomUUID()).token;
+                req.headers.authorization = `Bearer ${token}`;
+                next();
+            },
             logLevel: 'warn',
         };
 

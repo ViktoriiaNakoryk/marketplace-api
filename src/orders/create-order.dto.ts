@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { ArrayMinSize, IsArray, IsInt, Min, ValidateNested } from 'class-validator';
+import { ArrayMinSize, IsArray, IsInt, IsOptional, Min, ValidateNested } from 'class-validator';
 
 export class OrderItemDto {
     @IsInt()
@@ -12,9 +12,10 @@ export class OrderItemDto {
 }
 
 export class CreateOrderDto {
+    @IsOptional()
     @IsInt()
     @Min(1)
-    buyerId: number;
+    buyerId?: number;
 
     @IsArray()
     @ArrayMinSize(1)

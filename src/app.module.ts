@@ -14,6 +14,7 @@ import { OrdersRepository } from "./orders/orders.repository";
 import { OrdersService } from "./orders/orders.service";
 import { OrderEventsService } from "./orders/order-events.service";
 import { OrdersGateway } from "./orders/orders.gateway";
+import { RedisModule } from "./redis/redis.module";
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { OrdersGateway } from "./orders/orders.gateway";
     }),
     DatabaseModule,
     MessagingModule,
+    RedisModule,
   ],
   controllers: [AppController, ProductsController, OrdersController, HealthController],
   providers: [

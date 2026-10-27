@@ -16,6 +16,13 @@ export type NewProduct = {
 
 export type ProductRecord = NewProduct & { id: number };
 
+export type ProductCard = ProductRecord & {
+    sellerName: string;
+    unitsSold: number;
+    ordersCount: number;
+    revenue: number;
+};
+
 const COLUMNS = `id, "sellerId", sku, name, description, category, brand, price, stock`;
 
 function toProduct(row: Record<string, unknown>): ProductRecord {
@@ -49,6 +56,35 @@ export class ProductsRepository {
     async findById(id: number): Promise<ProductRecord | null> {
         const { rows } = await this.db.query(`SELECT ${COLUMNS} FROM products WHERE id = $1`, [id]);
         return rows[0] ? toProduct(rows[0]) : null;
+    }
+
+    async findCard(id: number): Promise<ProductCard | null> {
+        const { rows } = await this.db.query(
+            `SELECT p.id, p."sellerId", p.sku, p.name, p.description, p.category, p.brand, p.price, p.stock,
+                    u."fullName" AS "sellerName",
+                    COALESCE(s.units, 0) AS "unitsSold",
+                    COALESCE(s.orders, 0) AS "ordersCount",
+                    COALESCE(s.revenue, 0) AS revenue
+             FROM products p
+             JOIN users u ON u.id = p."sellerId"
+             LEFT JOIN LATERAL (
+                 SELECT sum(oi.quantity) AS units,
+                        count(DISTINCT oi."orderId") AS orders,
+                        sum(oi.quantity * oi."unitPrice") AS revenue
+                 FROM order_items oi
+                 WHERE oi."productId" = p.id
+             ) s ON true
+             WHERE p.id = $1`,
+            [id],
+        );
+        if (!rows[0]) return null;
+        return {
+            ...toProduct(rows[0]),
+            sellerName: rows[0].sellerName as string,
+            unitsSold: Number(rows[0].unitsSold),
+            ordersCount: Number(rows[0].ordersCount),
+            revenue: Number(rows[0].revenue),
+        };
     }
 
     async list(limit = 20, cursor?: string): Promise<Page<ProductRecord>> {

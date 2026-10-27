@@ -59,7 +59,14 @@
     "predemo:queue": "npm run -s build",
     "demo:queue": "bash scripts/with-secrets.sh dev node dist/demos/demo-queue.js",
     "preworker": "npm run -s build",
-    "worker": "bash scripts/with-secrets.sh dev node dist/worker.js"
+    "worker": "bash scripts/with-secrets.sh dev node dist/worker.js",
+    "start:vault": "bash scripts/with-secrets.sh dev npm run start",
+    "predemo:auth": "npm run -s build",
+    "demo:auth": "bash scripts/with-secrets.sh dev node dist/demos/demo-auth.js",
+    "predemo:reuse": "npm run -s build",
+    "demo:reuse": "bash scripts/with-secrets.sh dev node dist/demos/demo-reuse.js",
+    "predemo:rbac": "npm run -s build",
+    "demo:rbac": "bash scripts/with-secrets.sh dev node dist/demos/demo-rbac.js"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",
@@ -73,6 +80,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "ioredis": "^5.11.1",
+    "jsonwebtoken": "^9.0.3",
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
@@ -90,6 +98,7 @@
     "@types/amqplib": "^0.10.8",
     "@types/express": "^5.0.0",
     "@types/jest": "^30.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.23.1",
     "@types/supertest": "^7.0.0",

@@ -1,7 +1,7 @@
 import type { Pool } from 'pg';
 import { ORDER_ID, PRODUCT_ID } from './pact.config';
 
-const BUYER_ID = 9001;
+export const BUYER_ID = 9001;
 const SELLER_ID = 9002;
 
 async function givenProduct(pool: Pool): Promise<void> {

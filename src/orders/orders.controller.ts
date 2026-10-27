@@ -2,6 +2,7 @@ import {
     BadRequestException,
     Body,
     Controller,
+    ForbiddenException,
     Get,
     Headers,
     HttpCode,
@@ -13,13 +14,16 @@ import {
     Query,
     Req,
     Res,
+    UseGuards,
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import { CurrentUser, JwtAuthGuard, Roles, RolesGuard } from '../auth/guards';
+import type { AccessClaims } from '../auth/token.service';
 import { PageQueryDto } from '../common/page';
 import { ChangeStatusDto } from './change-status.dto';
 import { CreateOrderDto } from './create-order.dto';
 import { OrderEventsService, OrderStatusEvent } from './order-events.service';
-import { OrdersRepository } from './orders.repository';
+import { OrdersRepository, type OrderSummary } from './orders.repository';
 import { OrdersService } from './orders.service';
 
 const HEARTBEAT_MS = 15_000;
@@ -33,7 +37,14 @@ function parseLastEventId(raw: string | undefined): number | undefined {
     return raw !== undefined && Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
+function assertCanSee(order: OrderSummary, user: AccessClaims): void {
+    if (user.role !== 'admin' && order.buyerId !== user.sub) {
+        throw new ForbiddenException(`Order ${order.id} belongs to another buyer`);
+    }
+}
+
 @Controller('orders')
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class OrdersController {
     constructor(
         private readonly orders: OrdersRepository,
@@ -42,14 +53,15 @@ export class OrdersController {
     ) {}
 
     @Get()
-    findAll(@Query() query: PageQueryDto) {
-        return this.orders.list(query.limit, query.cursor);
+    findAll(@Query() query: PageQueryDto, @CurrentUser() user: AccessClaims) {
+        return this.orders.list(query.limit, query.cursor, user.role === 'admin' ? undefined : user.sub);
     }
 
     @Get(':id')
-    async findOne(@Param('id', ParseIntPipe) id: number) {
+    async findOne(@Param('id', ParseIntPipe) id: number, @CurrentUser() user: AccessClaims) {
         const order = await this.orders.findById(id);
         if (!order) throw new NotFoundException(`Order ${id} not found`);
+        assertCanSee(order, user);
         return order;
     }
 
@@ -57,24 +69,30 @@ export class OrdersController {
     @HttpCode(201)
     async create(
         @Body() body: CreateOrderDto,
+        @CurrentUser() user: AccessClaims,
         @Res({ passthrough: true }) res: Response,
         @Headers('idempotency-key') idempotencyKey?: string,
     ) {
         if (!idempotencyKey) throw new BadRequestException('Idempotency-Key header is required');
+        const buyerId = body.buyerId ?? user.sub;
+        if (buyerId !== user.sub && user.role !== 'admin') {
+            throw new ForbiddenException('Orders can only be placed on your own behalf');
+        }
         try {
-            const result = await this.ordersService.placeOrder(body, idempotencyKey);
+            const result = await this.ordersService.placeOrder({ buyerId, items: body.items }, idempotencyKey);
             if (!result) throw new BadRequestException('Order references an unknown product');
             if (result.replayed) res.setHeader('Idempotent-Replayed', 'true');
             return result.order;
         } catch (e) {
             if ((e as { code?: string }).code === '23503') {
-                throw new BadRequestException(`Buyer ${body.buyerId} does not exist`);
+                throw new BadRequestException(`Buyer ${buyerId} does not exist`);
             }
             throw e;
         }
     }
 
     @Patch(':id/status')
+    @Roles('admin')
     changeStatus(@Param('id', ParseIntPipe) id: number, @Body() body: ChangeStatusDto) {
         return this.ordersService.changeStatus(id, body.status);
     }
@@ -83,10 +101,13 @@ export class OrdersController {
     async streamEvents(
         @Param('id', ParseIntPipe) id: number,
         @Headers('last-event-id') lastEventId: string | undefined,
+        @CurrentUser() user: AccessClaims,
         @Req() req: Request,
         @Res() res: Response,
     ) {
-        if (!(await this.orders.findById(id))) throw new NotFoundException(`Order ${id} not found`);
+        const order = await this.orders.findById(id);
+        if (!order) throw new NotFoundException(`Order ${id} not found`);
+        assertCanSee(order, user);
 
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',

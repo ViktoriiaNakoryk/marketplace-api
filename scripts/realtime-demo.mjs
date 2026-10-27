@@ -7,7 +7,10 @@ const sameRoom = process.argv.includes('--same-room');
 async function http(method, path, body) {
     const res = await fetch(`${BASE_URL}${path}`, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+            'Content-Type': 'application/json',
+            ...(process.env.ACCESS_TOKEN ? { Authorization: `Bearer ${process.env.ACCESS_TOKEN}` } : {}),
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`${method} ${path} → ${res.status} ${await res.text()}`);

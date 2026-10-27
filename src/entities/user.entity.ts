@@ -28,6 +28,9 @@ export class User {
     @Column({ type: 'bigint', default: 0 })
     balance: string;
 
+    @Column({ name: 'password_hash', type: 'text', nullable: true })
+    passwordHash: string | null;
+
     @CreateDateColumn({ type: 'timestamptz' })
     createdAt: Date;
 

@@ -116,13 +116,14 @@ export class OrdersRepository {
         };
     }
 
-    async list(limit = 20, cursor?: string): Promise<Page<OrderSummary>> {
+    async list(limit = 20, cursor?: string, buyerId?: number): Promise<Page<OrderSummary>> {
         const { rows } = await this.db.query(
             `SELECT id, "buyerId", status, total, "createdAt" FROM orders
              WHERE ($2::bigint IS NULL OR id > $2::bigint)
+               AND ($3::bigint IS NULL OR "buyerId" = $3::bigint)
              ORDER BY id
              LIMIT $1 + 1`,
-            [limit, cursor ?? null],
+            [limit, cursor ?? null, buyerId ?? null],
         );
         return toPage(rows.map(toSummary), limit);
     }

@@ -49,7 +49,17 @@
     "predemo:crash-write": "npm run -s build",
     "demo:crash-write": "bash scripts/with-secrets.sh dev node dist/demos/demo-crash-write.js",
     "predemo:crash-relay": "npm run -s build",
-    "demo:crash-relay": "bash scripts/with-secrets.sh dev node dist/demos/demo-crash-relay.js"
+    "demo:crash-relay": "bash scripts/with-secrets.sh dev node dist/demos/demo-crash-relay.js",
+    "predemo:cache": "npm run -s build",
+    "demo:cache": "bash scripts/with-secrets.sh dev node dist/demos/demo-cache.js",
+    "predemo:session": "npm run -s build",
+    "demo:session": "bash scripts/with-secrets.sh dev node dist/demos/demo-session.js",
+    "predemo:ratelimit": "npm run -s build",
+    "demo:ratelimit": "bash scripts/with-secrets.sh dev node dist/demos/demo-ratelimit.js",
+    "predemo:queue": "npm run -s build",
+    "demo:queue": "bash scripts/with-secrets.sh dev node dist/demos/demo-queue.js",
+    "preworker": "npm run -s build",
+    "worker": "bash scripts/with-secrets.sh dev node dist/worker.js"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",
@@ -59,8 +69,10 @@
     "@nestjs/platform-socket.io": "^12.1.2",
     "@nestjs/websockets": "^12.1.2",
     "amqplib": "^2.2.0",
+    "bullmq": "^6.5.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "ioredis": "^5.11.1",
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
@@ -92,6 +104,6 @@
     "ts-loader": "^9.5.2",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
-    "typescript": "^6.0.2"
+    "typescript": "~6.0.3"
   }
 }

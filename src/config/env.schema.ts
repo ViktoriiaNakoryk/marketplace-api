@@ -6,6 +6,8 @@ export const envSchema = z.object({
     LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
     DB_PASSWORD_FILE: z.string().default('./secrets/db_password'),
     BROKER_URL: z.url({ protocol: /^amqps?$/ }).optional(),
+    REDIS_URL: z.url({ protocol: /^rediss?$/ }).optional(),
+    REDIS_QUEUE_URL: z.url({ protocol: /^rediss?$/ }).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
